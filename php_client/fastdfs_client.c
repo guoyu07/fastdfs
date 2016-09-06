@@ -1,15 +1,4 @@
-#ifdef HAVE_CONFIG_H
-#include "config.h"
-#endif
-
-#include <php.h>
-
-#ifdef ZTS
-#include "TSRM.h"
-#endif
-
-#include <SAPI.h>
-#include <php_ini.h>
+#include "php7_ext_wrapper.h"
 #include "ext/standard/info.h"
 #include <zend_extensions.h>
 #include <zend_exceptions.h>
@@ -40,9 +29,14 @@ typedef struct
 
 typedef struct
 {
-        zend_object zo;
-        FDFSConfigInfo *pConfigInfo;
+#if PHP_MAJOR_VERSION < 7
+	zend_object zo;
+#endif
+	FDFSConfigInfo *pConfigInfo;
 	FDFSPhpContext context;
+#if PHP_MAJOR_VERSION >= 7
+	zend_object zo;
+#endif
 } php_fdfs_t;
 
 typedef struct
@@ -57,18 +51,32 @@ typedef struct
 	int64_t file_size;
 } php_fdfs_upload_callback_t;
 
+
+#if PHP_MAJOR_VERSION < 7
+#define fdfs_get_object(obj) zend_object_store_get_object(obj)
+#else
+#define fdfs_get_object(obj) (void *)((char *)(Z_OBJ_P(obj)) - XtOffsetOf(php_fdfs_t, zo))
+#endif
+
+
 static int php_fdfs_download_callback(void *arg, const int64_t file_size, \
 		const char *data, const int current_size);
+
+static void php_fdfs_free_storage(php_fdfs_t *i_obj);
 
 static FDFSConfigInfo *config_list = NULL;
 static int config_count = 0;
 
 static FDFSPhpContext php_context = {&g_tracker_group, 0};
 
-static int le_fdht;
+static int le_fdfs;
 
 static zend_class_entry *fdfs_ce = NULL;
 static zend_class_entry *fdfs_exception_ce = NULL;
+
+#if PHP_MAJOR_VERSION >= 7
+static zend_object_handlers fdfs_object_handlers;
+#endif
 
 #if HAVE_SPL
 static zend_class_entry *spl_ce_RuntimeException = NULL;
@@ -89,7 +97,7 @@ const zend_fcall_info empty_fcall_info = { 0, NULL, NULL, NULL, NULL, 0, NULL, N
 	    MAKE_STD_ZVAL(sock_zval); \
 	    ZVAL_LONG(sock_zval, -1); \
 	\
-	    zend_hash_update(php_hash, "sock", sizeof("sock"), \
+	    zend_hash_update_wrapper(php_hash, "sock", sizeof("sock"), \
 			    &sock_zval, sizeof(zval *), NULL); \
 	}
 
@@ -198,6 +206,9 @@ static int fastdfs_convert_metadata_to_array(zval *metadata_obj, \
 	HashPosition pointer;
 	zval ***ppp;
 	zval **data;
+#if PHP_MAJOR_VERSION >= 7
+	zval *for_php7;
+#endif
 	FDFSMetaData *pMetaData;
 
 	meta_hash = Z_ARRVAL_P(metadata_obj);
@@ -222,12 +233,26 @@ static int fastdfs_convert_metadata_to_array(zval *metadata_obj, \
 	memset(*meta_list, 0, sizeof(FDFSMetaData) * (*meta_count));
 	pMetaData = *meta_list;
 	ppp = &data;
+
+#if PHP_MAJOR_VERSION < 7
 	for (zend_hash_internal_pointer_reset_ex(meta_hash, &pointer); \
 		zend_hash_get_current_data_ex(meta_hash, (void **)ppp, &pointer)
 		 == SUCCESS; zend_hash_move_forward_ex(meta_hash, &pointer))
+#else
+	data = &for_php7;
+	for (zend_hash_internal_pointer_reset_ex(meta_hash, &pointer); \
+		(for_php7=zend_hash_get_current_data_ex(meta_hash, &pointer))
+		 != NULL; zend_hash_move_forward_ex(meta_hash, &pointer))
+#endif
 	{
+#if PHP_MAJOR_VERSION < 7
 		if (zend_hash_get_current_key_ex(meta_hash, &szKey, \
 			 &(key_len), &index, 0, &pointer) != HASH_KEY_IS_STRING)
+#else
+		zend_string *_key_ptr;
+		if (zend_hash_get_current_key_ex(meta_hash, &_key_ptr, \
+			 (zend_ulong *)&index, &pointer) != HASH_KEY_IS_STRING)
+#endif
 		{
 			logError("file: "__FILE__", line: %d, " \
 				"invalid array element, " \
@@ -239,13 +264,17 @@ static int fastdfs_convert_metadata_to_array(zval *metadata_obj, \
 			return EINVAL;
 		}
 
+#if PHP_MAJOR_VERSION >= 7
+		szKey = _key_ptr->val;
+		key_len = _key_ptr->len;
+#endif
 		if (key_len > FDFS_MAX_META_NAME_LEN)
 		{
 			key_len = FDFS_MAX_META_NAME_LEN;
 		}
 		memcpy(pMetaData->name, szKey, key_len);
 
-		if ((*data)->type == IS_STRING)
+		if (ZEND_TYPE_OF(*data) == IS_STRING)
 		{
 			szValue = Z_STRVAL_PP(data);
 			value_len = Z_STRLEN_PP(data);
@@ -256,11 +285,11 @@ static int fastdfs_convert_metadata_to_array(zval *metadata_obj, \
 			}
 			memcpy(pMetaData->value, szValue, value_len);
 		}
-		else if ((*data)->type == IS_LONG || (*data)->type == IS_BOOL)
+		else if (ZEND_TYPE_OF(*data) == IS_LONG || ZEND_IS_BOOL(*data))
 		{
 			sprintf(pMetaData->value, "%ld", (*data)->value.lval);
 		}
-		else if ((*data)->type == IS_DOUBLE)
+		else if (ZEND_TYPE_OF(*data) == IS_DOUBLE)
 		{
 			sprintf(pMetaData->value, "%.2f", (*data)->value.dval);
 		}
@@ -268,7 +297,7 @@ static int fastdfs_convert_metadata_to_array(zval *metadata_obj, \
 		{
 			logError("file: "__FILE__", line: %d, " \
 				"invalid array element, key=%s, value type=%d",\
-				 __LINE__, szKey, (*data)->type);
+				 __LINE__, szKey, ZEND_TYPE_OF(*data));
 
 			free(*meta_list);
 			*meta_list = NULL;
@@ -308,11 +337,11 @@ static void php_fdfs_tracker_get_connection_impl(INTERNAL_FUNCTION_PARAMETERS, \
 	pContext->err_no = 0;
 	array_init(return_value);
 	
-	add_assoc_stringl_ex(return_value, "ip_addr", sizeof("ip_addr"), \
+	zend_add_assoc_stringl_ex(return_value, "ip_addr", sizeof("ip_addr"), \
 		pTrackerServer->ip_addr, strlen(pTrackerServer->ip_addr), 1);
-	add_assoc_long_ex(return_value, "port", sizeof("port"), \
+	zend_add_assoc_long_ex(return_value, "port", sizeof("port"), \
 		pTrackerServer->port);
-	add_assoc_long_ex(return_value, "sock", sizeof("sock"), \
+	zend_add_assoc_long_ex(return_value, "sock", sizeof("sock"), \
 		pTrackerServer->sock);
 }
 
@@ -368,7 +397,7 @@ static void php_fdfs_connect_server_impl(INTERNAL_FUNCTION_PARAMETERS, \
 {
 	int argc;
 	char *ip_addr;
-	int ip_len;
+	zend_size_t ip_len;
 	long port;
 	ConnectionInfo server_info;
 
@@ -400,11 +429,11 @@ static void php_fdfs_connect_server_impl(INTERNAL_FUNCTION_PARAMETERS, \
 			g_fdfs_network_timeout)) == 0)
 	{
 		array_init(return_value);
-		add_assoc_stringl_ex(return_value, "ip_addr", \
+		zend_add_assoc_stringl_ex(return_value, "ip_addr", \
 			sizeof("ip_addr"), ip_addr, ip_len, 1);
-		add_assoc_long_ex(return_value, "port", sizeof("port"), \
+		zend_add_assoc_long_ex(return_value, "port", sizeof("port"), \
 			port);
-		add_assoc_long_ex(return_value, "sock", sizeof("sock"), \
+		zend_add_assoc_long_ex(return_value, "sock", sizeof("sock"), \
 			server_info.sock);
 	}
 	else
@@ -419,8 +448,7 @@ static void php_fdfs_disconnect_server_impl(INTERNAL_FUNCTION_PARAMETERS, \
 	int argc;
 	zval *server_info;
 	HashTable *tracker_hash;
-	zval **data;
-	zval ***ppp;
+	zval *data;
 	int sock;
 
 	argc = ZEND_NUM_ARGS();
@@ -443,18 +471,16 @@ static void php_fdfs_disconnect_server_impl(INTERNAL_FUNCTION_PARAMETERS, \
 	}
 
 	tracker_hash = Z_ARRVAL_P(server_info);
-	data = NULL;
-	ppp = &data;
-	if (zend_hash_find(tracker_hash, "sock", sizeof("sock"), \
-			(void **)ppp) == FAILURE)
+	if (zend_hash_find_wrapper(tracker_hash, "sock", sizeof("sock"), \
+			&data) == FAILURE)
 	{
 		pContext->err_no = ENOENT;
 		RETURN_BOOL(false);
 	}
 
-	if ((*data)->type == IS_LONG)
+	if (ZEND_TYPE_OF(data) == IS_LONG)
 	{
-		sock = (*data)->value.lval;
+		sock = data->value.lval;
 		if (sock >= 0)
 		{
 			close(sock);
@@ -469,7 +495,7 @@ static void php_fdfs_disconnect_server_impl(INTERNAL_FUNCTION_PARAMETERS, \
 	{
 		logError("file: "__FILE__", line: %d, " \
 			"sock type is invalid, type=%d!", \
-			__LINE__, (*data)->type);
+			__LINE__, ZEND_TYPE_OF(data));
 		pContext->err_no = EINVAL;
 		RETURN_BOOL(false);
 	}
@@ -478,36 +504,32 @@ static void php_fdfs_disconnect_server_impl(INTERNAL_FUNCTION_PARAMETERS, \
 static int php_fdfs_get_callback_from_hash(HashTable *callback_hash, \
 		php_fdfs_callback_t *pCallback)
 {
-	zval **data;
-	zval ***ppp;
+	zval *data;
 
-	data = NULL;
-	ppp = &data;
-	if (zend_hash_find(callback_hash, "callback", sizeof("callback"), \
-			(void **)ppp) == FAILURE)
+	if (zend_hash_find_wrapper(callback_hash, "callback", sizeof("callback"), \
+			&data) == FAILURE)
 	{
 		logError("file: "__FILE__", line: %d, " \
 			"key \"callback\" not exist!", __LINE__);
 		return ENOENT;
 	}
-	if ((*data)->type != IS_STRING)
+	if (ZEND_TYPE_OF(data) != IS_STRING)
 	{
 		logError("file: "__FILE__", line: %d, " \
 			"key \"callback\" is not string type, type=%d!", \
-			__LINE__, (*data)->type);
+			__LINE__, ZEND_TYPE_OF(data));
 		return EINVAL;
 	}
-	pCallback->func_name = *data;
+	pCallback->func_name = data;
 
-	data = NULL;
-	if (zend_hash_find(callback_hash, "args", sizeof("args"), \
-			(void **)ppp) == FAILURE)
+	if (zend_hash_find_wrapper(callback_hash, "args", sizeof("args"), \
+			&data) == FAILURE)
 	{
 		pCallback->args = NULL;
 	}
 	else
 	{
-		pCallback->args = ((*data)->type == IS_NULL) ? NULL : *data;
+		pCallback->args = (ZEND_TYPE_OF(data) == IS_NULL) ? NULL : data;
 	}
 
 	return 0;
@@ -516,8 +538,7 @@ static int php_fdfs_get_callback_from_hash(HashTable *callback_hash, \
 static int php_fdfs_get_upload_callback_from_hash(HashTable *callback_hash, \
 		php_fdfs_upload_callback_t *pUploadCallback)
 {
-	zval **data;
-	zval ***ppp;
+	zval *data;
 	int result;
 
 	if ((result=php_fdfs_get_callback_from_hash(callback_hash, \
@@ -526,23 +547,21 @@ static int php_fdfs_get_upload_callback_from_hash(HashTable *callback_hash, \
 		return result;
 	}
 
-	data = NULL;
-	ppp = &data;
-	if (zend_hash_find(callback_hash, "file_size", sizeof("file_size"), \
-			(void **)ppp) == FAILURE)
+	if (zend_hash_find_wrapper(callback_hash, "file_size", sizeof("file_size"), \
+			&data) == FAILURE)
 	{
 		logError("file: "__FILE__", line: %d, " \
 			"key \"file_size\" not exist!", __LINE__);
 		return ENOENT;
 	}
-	if ((*data)->type != IS_LONG)
+	if (ZEND_TYPE_OF(data) != IS_LONG)
 	{
 		logError("file: "__FILE__", line: %d, " \
 			"key \"file_size\" is not long type, type=%d!", \
-			__LINE__, (*data)->type);
+			__LINE__, ZEND_TYPE_OF(data));
 		return EINVAL;
 	}
-	pUploadCallback->file_size = (*data)->value.lval;
+	pUploadCallback->file_size = data->value.lval;
 	if (pUploadCallback->file_size < 0)
 	{
 		logError("file: "__FILE__", line: %d, " \
@@ -557,69 +576,67 @@ static int php_fdfs_get_upload_callback_from_hash(HashTable *callback_hash, \
 static int php_fdfs_get_server_from_hash(HashTable *tracker_hash, \
 		ConnectionInfo *pTrackerServer)
 {
-	zval **data;
-	zval ***ppp;
+	zval *data;
 	char *ip_addr;
 	int ip_len;
 
 	memset(pTrackerServer, 0, sizeof(ConnectionInfo));
 	data = NULL;
-	ppp = &data;
-	if (zend_hash_find(tracker_hash, "ip_addr", sizeof("ip_addr"), \
-			(void **)ppp) == FAILURE)
+	if (zend_hash_find_wrapper(tracker_hash, "ip_addr", sizeof("ip_addr"), \
+			&data) == FAILURE)
 	{
 		logError("file: "__FILE__", line: %d, " \
 			"key \"ip_addr\" not exist!", __LINE__);
 		return ENOENT;
 	}
-	if ((*data)->type != IS_STRING)
+	if (ZEND_TYPE_OF(data) != IS_STRING)
 	{
 		logError("file: "__FILE__", line: %d, " \
 			"key \"ip_addr\" is not string type, type=%d!", \
-			__LINE__, (*data)->type);
+			__LINE__, ZEND_TYPE_OF(data));
 		return EINVAL;
 	}
 
-	ip_addr = Z_STRVAL_PP(data);
-	ip_len = Z_STRLEN_PP(data);
+	ip_addr = Z_STRVAL_P(data);
+	ip_len = Z_STRLEN_P(data);
 	if (ip_len >= IP_ADDRESS_SIZE)
 	{
 		ip_len = IP_ADDRESS_SIZE - 1;
 	}
 	memcpy(pTrackerServer->ip_addr, ip_addr, ip_len);
 
-	if (zend_hash_find(tracker_hash, "port", sizeof("port"), \
-			(void **)ppp) == FAILURE)
+	if (zend_hash_find_wrapper(tracker_hash, "port", sizeof("port"), \
+			&data) == FAILURE)
 	{
 		logError("file: "__FILE__", line: %d, " \
 			"key \"port\" not exist!", __LINE__);
 		return ENOENT;
 	}
-	if ((*data)->type != IS_LONG)
+	if (ZEND_TYPE_OF(data) != IS_LONG)
 	{
 		logError("file: "__FILE__", line: %d, " \
 			"key \"port\" is not long type, type=%d!", \
-			__LINE__, (*data)->type);
+			__LINE__, ZEND_TYPE_OF(data));
 		return EINVAL;
 	}
-	pTrackerServer->port = (*data)->value.lval;
+	pTrackerServer->port = data->value.lval;
 
-	if (zend_hash_find(tracker_hash, "sock", sizeof("sock"), \
-			(void **)ppp) == FAILURE)
+	if (zend_hash_find_wrapper(tracker_hash, "sock", sizeof("sock"), \
+			&data) == FAILURE)
 	{
 		logError("file: "__FILE__", line: %d, " \
 			"key \"sock\" not exist!", __LINE__);
 		return ENOENT;
 	}
-	if ((*data)->type != IS_LONG)
+	if (ZEND_TYPE_OF(data) != IS_LONG)
 	{
 		logError("file: "__FILE__", line: %d, " \
 			"key \"sock\" is not long type, type=%d!", \
-			__LINE__, (*data)->type);
+			__LINE__, ZEND_TYPE_OF(data));
 		return EINVAL;
 	}
 
-	pTrackerServer->sock = (*data)->value.lval;
+	pTrackerServer->sock = data->value.lval;
 	return 0;
 }
 
@@ -673,7 +690,7 @@ static void php_fdfs_tracker_list_groups_impl(INTERNAL_FUNCTION_PARAMETERS, \
 {
 	int argc;
 	char *group_name;
-	int group_nlen;
+	zend_size_t group_nlen;
 	zval *tracker_obj;
 	zval *group_info_array;
 	zval *server_info_array;
@@ -779,34 +796,34 @@ static void php_fdfs_tracker_list_groups_impl(INTERNAL_FUNCTION_PARAMETERS, \
 		ALLOC_INIT_ZVAL(group_info_array);
 		array_init(group_info_array);
 
-		add_assoc_zval_ex(return_value, pGroupStat->group_name, \
+		zend_add_assoc_zval_ex(return_value, pGroupStat->group_name, \
 			strlen(pGroupStat->group_name) + 1, group_info_array);
 
-		add_assoc_long_ex(group_info_array, "total_space", \
+		zend_add_assoc_long_ex(group_info_array, "total_space", \
 			sizeof("total_space"), pGroupStat->total_mb);
-		add_assoc_long_ex(group_info_array, "free_space", \
+		zend_add_assoc_long_ex(group_info_array, "free_space", \
 			sizeof("free_space"), pGroupStat->free_mb);
-		add_assoc_long_ex(group_info_array, "trunk_free_space", \
+		zend_add_assoc_long_ex(group_info_array, "trunk_free_space", \
 			sizeof("trunk_free_space"), pGroupStat->trunk_free_mb);
-		add_assoc_long_ex(group_info_array, "server_count", \
+		zend_add_assoc_long_ex(group_info_array, "server_count", \
 			sizeof("server_count"), pGroupStat->count);
-		add_assoc_long_ex(group_info_array, "active_count", \
+		zend_add_assoc_long_ex(group_info_array, "active_count", \
 			sizeof("active_count"), pGroupStat->active_count);
-		add_assoc_long_ex(group_info_array, "storage_port", \
+		zend_add_assoc_long_ex(group_info_array, "storage_port", \
 			sizeof("storage_port"), pGroupStat->storage_port);
-		add_assoc_long_ex(group_info_array, "storage_http_port", \
+		zend_add_assoc_long_ex(group_info_array, "storage_http_port", \
 			sizeof("storage_http_port"), \
 			pGroupStat->storage_http_port);
-		add_assoc_long_ex(group_info_array, "store_path_count", \
+		zend_add_assoc_long_ex(group_info_array, "store_path_count", \
 			sizeof("store_path_count"), \
 			pGroupStat->store_path_count);
-		add_assoc_long_ex(group_info_array, "subdir_count_per_path", \
+		zend_add_assoc_long_ex(group_info_array, "subdir_count_per_path", \
 			sizeof("subdir_count_per_path"), \
 			pGroupStat->subdir_count_per_path);
-		add_assoc_long_ex(group_info_array, "current_write_server", \
+		zend_add_assoc_long_ex(group_info_array, "current_write_server", \
 			sizeof("current_write_server"), \
 			pGroupStat->current_write_server);
-		add_assoc_long_ex(group_info_array, "current_trunk_file_id", \
+		zend_add_assoc_long_ex(group_info_array, "current_trunk_file_id", \
 			sizeof("current_trunk_file_id"), \
 			pGroupStat->current_trunk_file_id);
 		       
@@ -832,274 +849,274 @@ static void php_fdfs_tracker_list_groups_impl(INTERNAL_FUNCTION_PARAMETERS, \
 			ALLOC_INIT_ZVAL(server_info_array);
 			array_init(server_info_array);
 
-			add_assoc_zval_ex(group_info_array, pStorage->id, \
+			zend_add_assoc_zval_ex(group_info_array, pStorage->id, \
 				strlen(pStorage->id) + 1, server_info_array);
 
-			add_assoc_stringl_ex(server_info_array, \
+			zend_add_assoc_stringl_ex(server_info_array, \
 				"ip_addr", sizeof("ip_addr"), \
 				pStorage->ip_addr, strlen(pStorage->ip_addr), 1);
 
-			add_assoc_long_ex(server_info_array, \
+			zend_add_assoc_long_ex(server_info_array, \
 				"join_time", sizeof("join_time"), \
 				pStorage->join_time);
 
-			add_assoc_long_ex(server_info_array, \
+			zend_add_assoc_long_ex(server_info_array, \
 				"up_time", sizeof("up_time"), \
 				pStorage->up_time);
 
-			add_assoc_stringl_ex(server_info_array, \
+			zend_add_assoc_stringl_ex(server_info_array, \
 				"http_domain", sizeof("http_domain"), \
 				pStorage->domain_name, \
 				strlen(pStorage->domain_name), 1);
 
-			add_assoc_stringl_ex(server_info_array, \
+			zend_add_assoc_stringl_ex(server_info_array, \
 				"version", sizeof("version"), \
 				pStorage->version, strlen(pStorage->version), 1);
 
-			add_assoc_stringl_ex(server_info_array, \
+			zend_add_assoc_stringl_ex(server_info_array, \
 				"src_storage_id", sizeof("src_storage_id"), \
 				pStorage->src_id, strlen(pStorage->src_id), 1);
 
-			add_assoc_bool_ex(server_info_array, \
+			zend_add_assoc_bool_ex(server_info_array, \
 				"if_trunk_server", sizeof("if_trunk_server"), \
 				pStorage->if_trunk_server);
 
-			add_assoc_long_ex(server_info_array, \
+			zend_add_assoc_long_ex(server_info_array, \
 				"upload_priority", sizeof("upload_priority"), \
 				pStorage->upload_priority);
 
-			add_assoc_long_ex(server_info_array, \
+			zend_add_assoc_long_ex(server_info_array, \
 				"store_path_count", sizeof("store_path_count"),\
 				pStorage->store_path_count);
 
-			add_assoc_long_ex(server_info_array, \
+			zend_add_assoc_long_ex(server_info_array, \
 				"subdir_count_per_path", \
 				sizeof("subdir_count_per_path"), \
 				pStorage->subdir_count_per_path);
 
-			add_assoc_long_ex(server_info_array, \
+			zend_add_assoc_long_ex(server_info_array, \
 				"storage_port", sizeof("storage_port"), \
 				pStorage->storage_port);
 
-			add_assoc_long_ex(server_info_array, \
+			zend_add_assoc_long_ex(server_info_array, \
 				"storage_http_port", \
 				sizeof("storage_http_port"), \
 				pStorage->storage_http_port);
 
-			add_assoc_long_ex(server_info_array, \
+			zend_add_assoc_long_ex(server_info_array, \
 				"current_write_path", \
 				sizeof("current_write_path"), \
 				pStorage->current_write_path);
 
-			add_assoc_long_ex(server_info_array, "status", \
+			zend_add_assoc_long_ex(server_info_array, "status", \
 				sizeof("status"), pStorage->status);
-			add_assoc_long_ex(server_info_array, "total_space", \
+			zend_add_assoc_long_ex(server_info_array, "total_space", \
 				sizeof("total_space"), pStorage->total_mb);
-			add_assoc_long_ex(server_info_array, "free_space", \
+			zend_add_assoc_long_ex(server_info_array, "free_space", \
 				sizeof("free_space"), pStorage->free_mb);
 
 			pStorageStat = &(pStorage->stat);
 
-			add_assoc_long_ex(server_info_array, \
+			zend_add_assoc_long_ex(server_info_array, \
 				"connection.alloc_count", \
 				sizeof("connection.alloc_count"), \
 				pStorageStat->connection.alloc_count);
 
-			add_assoc_long_ex(server_info_array, \
+			zend_add_assoc_long_ex(server_info_array, \
 				"connection.current_count", \
 				sizeof("connection.current_count"), \
 				pStorageStat->connection.current_count);
 
-			add_assoc_long_ex(server_info_array, \
+			zend_add_assoc_long_ex(server_info_array, \
 				"connection.max_count", \
 				sizeof("connection.max_count"), \
 				pStorageStat->connection.max_count);
 
-			add_assoc_long_ex(server_info_array, \
+			zend_add_assoc_long_ex(server_info_array, \
 				"total_upload_count", \
 				sizeof("total_upload_count"), \
 				pStorageStat->total_upload_count);
 
-			add_assoc_long_ex(server_info_array, \
+			zend_add_assoc_long_ex(server_info_array, \
 				"success_upload_count", \
 				sizeof("success_upload_count"), \
 				pStorageStat->success_upload_count);
 
-			add_assoc_long_ex(server_info_array, \
+			zend_add_assoc_long_ex(server_info_array, \
 				"total_append_count", \
 				sizeof("total_append_count"), \
 				pStorageStat->total_append_count);
 
-			add_assoc_long_ex(server_info_array, \
+			zend_add_assoc_long_ex(server_info_array, \
 				"success_append_count", \
 				sizeof("success_append_count"), \
 				pStorageStat->success_append_count);
 
-			add_assoc_long_ex(server_info_array, \
+			zend_add_assoc_long_ex(server_info_array, \
 				"total_modify_count", \
 				sizeof("total_modify_count"), \
 				pStorageStat->total_modify_count);
 
-			add_assoc_long_ex(server_info_array, \
+			zend_add_assoc_long_ex(server_info_array, \
 				"success_modify_count", \
 				sizeof("success_modify_count"), \
 				pStorageStat->success_modify_count);
 
-			add_assoc_long_ex(server_info_array, \
+			zend_add_assoc_long_ex(server_info_array, \
 				"total_truncate_count", \
 				sizeof("total_truncate_count"), \
 				pStorageStat->total_truncate_count);
 
-			add_assoc_long_ex(server_info_array, \
+			zend_add_assoc_long_ex(server_info_array, \
 				"success_truncate_count", \
 				sizeof("success_truncate_count"), \
 				pStorageStat->success_truncate_count);
 
-			add_assoc_long_ex(server_info_array, \
+			zend_add_assoc_long_ex(server_info_array, \
 				"total_set_meta_count", \
 				sizeof("total_set_meta_count"), \
 				pStorageStat->total_set_meta_count);
 
-			add_assoc_long_ex(server_info_array, \
+			zend_add_assoc_long_ex(server_info_array, \
 				"success_set_meta_count", \
 				sizeof("success_set_meta_count"), \
 				pStorageStat->success_set_meta_count);
 
-			add_assoc_long_ex(server_info_array, \
+			zend_add_assoc_long_ex(server_info_array, \
 				"total_delete_count", \
 				sizeof("total_delete_count"), \
 				pStorageStat->total_delete_count);
 
-			add_assoc_long_ex(server_info_array, \
+			zend_add_assoc_long_ex(server_info_array, \
 				"success_delete_count", \
 				sizeof("success_delete_count"), \
 				pStorageStat->success_delete_count);
 
-			add_assoc_long_ex(server_info_array, \
+			zend_add_assoc_long_ex(server_info_array, \
 				"total_download_count", \
 				sizeof("total_download_count"), \
 				pStorageStat->total_download_count);
 
-			add_assoc_long_ex(server_info_array, \
+			zend_add_assoc_long_ex(server_info_array, \
 				"success_download_count", \
 				sizeof("success_download_count"), \
 				pStorageStat->success_download_count);
 
-			add_assoc_long_ex(server_info_array, \
+			zend_add_assoc_long_ex(server_info_array, \
 				"total_get_meta_count", \
 				sizeof("total_get_meta_count"), \
 				pStorageStat->total_get_meta_count);
 
-			add_assoc_long_ex(server_info_array, \
+			zend_add_assoc_long_ex(server_info_array, \
 				"success_get_meta_count", \
 				sizeof("success_get_meta_count"), \
 				pStorageStat->success_get_meta_count);
 
-			add_assoc_long_ex(server_info_array, \
+			zend_add_assoc_long_ex(server_info_array, \
 				"total_create_link_count", \
 				sizeof("total_create_link_count"), \
 				pStorageStat->total_create_link_count);
 
-			add_assoc_long_ex(server_info_array, \
+			zend_add_assoc_long_ex(server_info_array, \
 				"success_create_link_count", \
 				sizeof("success_create_link_count"), \
 				pStorageStat->success_create_link_count);
 
-			add_assoc_long_ex(server_info_array, \
+			zend_add_assoc_long_ex(server_info_array, \
 				"total_delete_link_count", \
 				sizeof("total_delete_link_count"), \
 				pStorageStat->total_delete_link_count);
 
-			add_assoc_long_ex(server_info_array, \
+			zend_add_assoc_long_ex(server_info_array, \
 				"success_delete_link_count", \
 				sizeof("success_delete_link_count"), \
 				pStorageStat->success_delete_link_count);
-			add_assoc_long_ex(server_info_array, \
+			zend_add_assoc_long_ex(server_info_array, \
 				"total_upload_bytes", \
 				sizeof("total_upload_bytes"), \
 				pStorageStat->total_upload_bytes);
-			add_assoc_long_ex(server_info_array, \
+			zend_add_assoc_long_ex(server_info_array, \
 				"success_upload_bytes", \
 				sizeof("success_upload_bytes"), \
 				pStorageStat->success_upload_bytes);
-			add_assoc_long_ex(server_info_array, \
+			zend_add_assoc_long_ex(server_info_array, \
 				"total_append_bytes", \
 				sizeof("total_append_bytes"), \
 				pStorageStat->total_append_bytes);
-			add_assoc_long_ex(server_info_array, \
+			zend_add_assoc_long_ex(server_info_array, \
 				"success_append_bytes", \
 				sizeof("success_append_bytes"), \
 				pStorageStat->success_append_bytes);
-			add_assoc_long_ex(server_info_array, \
+			zend_add_assoc_long_ex(server_info_array, \
 				"total_modify_bytes", \
 				sizeof("total_modify_bytes"), \
 				pStorageStat->total_modify_bytes);
-			add_assoc_long_ex(server_info_array, \
+			zend_add_assoc_long_ex(server_info_array, \
 				"success_modify_bytes", \
 				sizeof("success_modify_bytes"), \
 				pStorageStat->success_modify_bytes);
-			add_assoc_long_ex(server_info_array, \
+			zend_add_assoc_long_ex(server_info_array, \
 				"total_download_bytes", \
 				sizeof("total_download_bytes"), \
 				pStorageStat->total_download_bytes);
-			add_assoc_long_ex(server_info_array, \
+			zend_add_assoc_long_ex(server_info_array, \
 				"success_download_bytes", \
 				sizeof("success_download_bytes"), \
 				pStorageStat->success_download_bytes);
-			add_assoc_long_ex(server_info_array, \
+			zend_add_assoc_long_ex(server_info_array, \
 				"total_sync_in_bytes", \
 				sizeof("total_sync_in_bytes"), \
 				pStorageStat->total_sync_in_bytes);
-			add_assoc_long_ex(server_info_array, \
+			zend_add_assoc_long_ex(server_info_array, \
 				"success_sync_in_bytes", \
 				sizeof("success_sync_in_bytes"), \
 				pStorageStat->success_sync_in_bytes);
-			add_assoc_long_ex(server_info_array, \
+			zend_add_assoc_long_ex(server_info_array, \
 				"total_sync_out_bytes", \
 				sizeof("total_sync_out_bytes"), \
 				pStorageStat->total_sync_out_bytes);
-			add_assoc_long_ex(server_info_array, \
+			zend_add_assoc_long_ex(server_info_array, \
 				"success_sync_out_bytes", \
 				sizeof("success_sync_out_bytes"), \
 				pStorageStat->success_sync_out_bytes);
-			add_assoc_long_ex(server_info_array, \
+			zend_add_assoc_long_ex(server_info_array, \
 				"total_file_open_count", \
 				sizeof("total_file_open_count"), \
 				pStorageStat->total_file_open_count);
-			add_assoc_long_ex(server_info_array, \
+			zend_add_assoc_long_ex(server_info_array, \
 				"success_file_open_count", \
 				sizeof("success_file_open_count"), \
 				pStorageStat->success_file_open_count);
-			add_assoc_long_ex(server_info_array, \
+			zend_add_assoc_long_ex(server_info_array, \
 				"total_file_read_count", \
 				sizeof("total_file_read_count"), \
 				pStorageStat->total_file_read_count);
-			add_assoc_long_ex(server_info_array, \
+			zend_add_assoc_long_ex(server_info_array, \
 				"success_file_read_count", \
 				sizeof("success_file_read_count"), \
 				pStorageStat->success_file_read_count);
-			add_assoc_long_ex(server_info_array, \
+			zend_add_assoc_long_ex(server_info_array, \
 				"total_file_write_count", \
 				sizeof("total_file_write_count"), \
 				pStorageStat->total_file_write_count);
-			add_assoc_long_ex(server_info_array, \
+			zend_add_assoc_long_ex(server_info_array, \
 				"success_file_write_count", \
 				sizeof("success_file_write_count"), \
 				pStorageStat->success_file_write_count);
-			add_assoc_long_ex(server_info_array, \
+			zend_add_assoc_long_ex(server_info_array, \
 				"last_heart_beat_time", \
 				sizeof("last_heart_beat_time"), \
 				pStorageStat->last_heart_beat_time);
 
-			add_assoc_long_ex(server_info_array, \
+			zend_add_assoc_long_ex(server_info_array, \
 				"last_source_update", \
 				sizeof("last_source_update"), \
 				pStorageStat->last_source_update);
-			add_assoc_long_ex(server_info_array, \
+			zend_add_assoc_long_ex(server_info_array, \
 				"last_sync_update", \
 				sizeof("last_sync_update"), \
 				pStorageStat->last_sync_update);
-			add_assoc_long_ex(server_info_array, \
+			zend_add_assoc_long_ex(server_info_array, \
 				"last_synced_timestamp", \
 				sizeof("last_synced_timestamp"), \
 				pStorageStat->last_synced_timestamp);
@@ -1114,7 +1131,7 @@ static void php_fdfs_tracker_query_storage_store_impl( \
 	int argc;
 	char new_group_name[FDFS_GROUP_NAME_MAX_LEN + 1];
 	char *group_name;
-	int group_nlen;
+	zend_size_t group_nlen;
 	zval *tracker_obj;
 	HashTable *tracker_hash;
 	ConnectionInfo tracker_server;
@@ -1202,13 +1219,13 @@ static void php_fdfs_tracker_query_storage_store_impl( \
 	}
 
 	array_init(return_value);
-	add_assoc_stringl_ex(return_value, "ip_addr", \
+	zend_add_assoc_stringl_ex(return_value, "ip_addr", \
 			sizeof("ip_addr"), storage_server.ip_addr, \
 			strlen(storage_server.ip_addr), 1);
-	add_assoc_long_ex(return_value, "port", sizeof("port"), \
+	zend_add_assoc_long_ex(return_value, "port", sizeof("port"), \
 			storage_server.port);
-	add_assoc_long_ex(return_value, "sock", sizeof("sock"), -1);
-	add_assoc_long_ex(return_value, "store_path_index", \
+	zend_add_assoc_long_ex(return_value, "sock", sizeof("sock"), -1);
+	zend_add_assoc_long_ex(return_value, "store_path_index", \
 			sizeof("store_path_index"), \
 			store_path_index);
 }
@@ -1220,7 +1237,7 @@ static void php_fdfs_tracker_query_storage_store_list_impl( \
 	int argc;
 	char *group_name;
 	char new_group_name[FDFS_GROUP_NAME_MAX_LEN + 1];
-	int group_nlen;
+	zend_size_t group_nlen;
 	zval *server_info_array;
 	zval *tracker_obj;
 	HashTable *tracker_hash;
@@ -1324,13 +1341,13 @@ static void php_fdfs_tracker_query_storage_store_list_impl( \
 		add_index_zval(return_value, pServer - storage_servers, \
 			server_info_array);
 
-		add_assoc_stringl_ex(server_info_array, "ip_addr", \
+		zend_add_assoc_stringl_ex(server_info_array, "ip_addr", \
 				sizeof("ip_addr"), pServer->ip_addr, \
 				strlen(pServer->ip_addr), 1);
-		add_assoc_long_ex(server_info_array, "port", sizeof("port"), \
+		zend_add_assoc_long_ex(server_info_array, "port", sizeof("port"), \
 				pServer->port);
-		add_assoc_long_ex(server_info_array, "sock", sizeof("sock"), -1);
-		add_assoc_long_ex(server_info_array, "store_path_index", \
+		zend_add_assoc_long_ex(server_info_array, "sock", sizeof("sock"), -1);
+		zend_add_assoc_long_ex(server_info_array, "store_path_index", \
 				sizeof("store_path_index"), \
 				store_path_index);
 	}
@@ -1344,8 +1361,8 @@ static void php_fdfs_tracker_do_query_storage_impl( \
 	int argc;
 	char *group_name;
 	char *remote_filename;
-	int group_nlen;
-	int filename_len;
+	zend_size_t group_nlen;
+	zend_size_t filename_len;
 	zval *tracker_obj;
 	HashTable *tracker_hash;
 	ConnectionInfo tracker_server;
@@ -1384,7 +1401,7 @@ static void php_fdfs_tracker_do_query_storage_impl( \
 	{
 		char *pSeperator;
 		char *file_id;
-		int file_id_len;
+		zend_size_t file_id_len;
 
 		if (zend_parse_parameters(ZEND_NUM_ARGS() TSRMLS_CC, "s|a", \
 			&file_id, &file_id_len, &tracker_obj) == FAILURE)
@@ -1465,12 +1482,12 @@ static void php_fdfs_tracker_do_query_storage_impl( \
 	}
 
 	array_init(return_value);
-	add_assoc_stringl_ex(return_value, "ip_addr", \
+	zend_add_assoc_stringl_ex(return_value, "ip_addr", \
 			sizeof("ip_addr"), storage_server.ip_addr, \
 			strlen(storage_server.ip_addr), 1);
-	add_assoc_long_ex(return_value, "port", sizeof("port"), \
+	zend_add_assoc_long_ex(return_value, "port", sizeof("port"), \
 			storage_server.port);
-	add_assoc_long_ex(return_value, "sock", sizeof("sock"), -1);
+	zend_add_assoc_long_ex(return_value, "sock", sizeof("sock"), -1);
 }
 
 static void php_fdfs_tracker_delete_storage_impl( \
@@ -1478,8 +1495,8 @@ static void php_fdfs_tracker_delete_storage_impl( \
 		FDFSPhpContext *pContext)
 {
 	int argc;
-	int group_name_len;
-	int storage_ip_len;
+	zend_size_t group_name_len;
+	zend_size_t storage_ip_len;
 	char *group_name;
 	char *storage_ip;
 
@@ -1531,8 +1548,8 @@ static void php_fdfs_storage_delete_file_impl( \
 	int argc;
 	char *group_name;
 	char *remote_filename;
-	int group_nlen;
-	int filename_len;
+	zend_size_t group_nlen;
+	zend_size_t filename_len;
 	zval *tracker_obj;
 	zval *storage_obj;
 	HashTable *tracker_hash;
@@ -1576,7 +1593,7 @@ static void php_fdfs_storage_delete_file_impl( \
 	{
 		char *pSeperator;
 		char *file_id;
-		int file_id_len;
+		zend_size_t file_id_len;
 
 		if (zend_parse_parameters(ZEND_NUM_ARGS() TSRMLS_CC, "s|aa", \
 			&file_id, &file_id_len, &tracker_obj, &storage_obj) \
@@ -1690,8 +1707,8 @@ static void php_fdfs_storage_truncate_file_impl( \
 	int argc;
 	char *group_name;
 	char *remote_filename;
-	int group_nlen;
-	int filename_len;
+	zend_size_t group_nlen;
+	zend_size_t filename_len;
 	zval *tracker_obj;
 	zval *storage_obj;
 	HashTable *tracker_hash;
@@ -1736,7 +1753,7 @@ static void php_fdfs_storage_truncate_file_impl( \
 	{
 		char *pSeperator;
 		char *file_id;
-		int file_id_len;
+		zend_size_t file_id_len;
 
 		if (zend_parse_parameters(ZEND_NUM_ARGS() TSRMLS_CC, \
 			"s|laa", &file_id, &file_id_len, \
@@ -1853,8 +1870,8 @@ static void php_fdfs_storage_download_file_to_callback_impl( \
 	char *group_name;
 	char *remote_filename;
 	zval *download_callback;
-	int group_nlen;
-	int filename_len;
+	zend_size_t group_nlen;
+	zend_size_t filename_len;
 	long file_offset;
 	long download_bytes;
 	int64_t file_size;
@@ -1905,7 +1922,7 @@ static void php_fdfs_storage_download_file_to_callback_impl( \
 	{
 		char *pSeperator;
 		char *file_id;
-		int file_id_len;
+		zend_size_t file_id_len;
 
 		if (zend_parse_parameters(ZEND_NUM_ARGS() TSRMLS_CC, \
 			"sa|llaa", &file_id, &file_id_len, \
@@ -2034,9 +2051,8 @@ static void php_fdfs_storage_download_file_to_buff_impl( \
 	char *group_name;
 	char *remote_filename;
 	char *file_buff;
-	char *new_file_buff;
-	int group_nlen;
-	int filename_len;
+	zend_size_t group_nlen;
+	zend_size_t filename_len;
 	long file_offset;
 	long download_bytes;
 	int64_t file_size;
@@ -2085,7 +2101,7 @@ static void php_fdfs_storage_download_file_to_buff_impl( \
 	{
 		char *pSeperator;
 		char *file_id;
-		int file_id_len;
+		zend_size_t file_id_len;
 
 		if (zend_parse_parameters(ZEND_NUM_ARGS() TSRMLS_CC, "s|llaa", \
 			&file_id, &file_id_len, &file_offset, &download_bytes, \
@@ -2191,23 +2207,8 @@ static void php_fdfs_storage_download_file_to_buff_impl( \
 		RETURN_BOOL(false);
 	}
 
-	new_file_buff = (char *)emalloc(file_size + 1);
-	if (new_file_buff == NULL)
-	{
-		logError("file: "__FILE__", line: %d, " \
-			"emalloc %d bytes fail, errno: %d, error info: %s", \
-			__LINE__, (int)file_size + 1, errno, STRERROR(errno));
-		free(file_buff);
-		pContext->err_no = errno != 0 ? errno : ENOMEM;
-		RETURN_BOOL(false);
-	}
-
-	memcpy(new_file_buff, file_buff, file_size);
-	*(new_file_buff + file_size) = '\0';
-	free(file_buff);
-
 	pContext->err_no = 0;
-	RETURN_STRINGL(new_file_buff, file_size, 0);
+	ZEND_RETURN_STRINGL_CALLBACK(file_buff, file_size, free);
 }
 
 static void php_fdfs_storage_download_file_to_file_impl( \
@@ -2218,9 +2219,9 @@ static void php_fdfs_storage_download_file_to_file_impl( \
 	char *group_name;
 	char *remote_filename;
 	char *local_filename;
-	int group_nlen;
-	int remote_file_nlen;
-	int local_file_nlen;
+	zend_size_t group_nlen;
+	zend_size_t remote_file_nlen;
+	zend_size_t local_file_nlen;
 	long file_offset;
 	long download_bytes;
 	int64_t file_size;
@@ -2254,7 +2255,7 @@ static void php_fdfs_storage_download_file_to_file_impl( \
 	if (argc < min_param_count || argc > max_param_count)
 	{
 		logError("file: "__FILE__", line: %d, " \
-			"storage_set_metadata parameters " \
+			"storage_download_file_to_file parameters " \
 			"count: %d < %d or > %d", __LINE__, argc, \
 			min_param_count, max_param_count);
 		pContext->err_no = EINVAL;
@@ -2269,7 +2270,7 @@ static void php_fdfs_storage_download_file_to_file_impl( \
 	{
 		char *pSeperator;
 		char *file_id;
-		int file_id_len;
+		zend_size_t file_id_len;
 
 		if (zend_parse_parameters(ZEND_NUM_ARGS() TSRMLS_CC, "ss|llaa",\
 			&file_id, &file_id_len, &local_filename, \
@@ -2388,8 +2389,8 @@ static void php_fdfs_storage_get_metadata_impl( \
 	int argc;
 	char *group_name;
 	char *remote_filename;
-	int group_nlen;
-	int filename_len;
+	zend_size_t group_nlen;
+	zend_size_t filename_len;
 	zval *tracker_obj;
 	zval *storage_obj;
 	HashTable *tracker_hash;
@@ -2437,7 +2438,7 @@ static void php_fdfs_storage_get_metadata_impl( \
 	{
 		char *pSeperator;
 		char *file_id;
-		int file_id_len;
+		zend_size_t file_id_len;
 
 		if (zend_parse_parameters(ZEND_NUM_ARGS() TSRMLS_CC, "s|aa", \
 			&file_id, &file_id_len, &tracker_obj, &storage_obj) \
@@ -2547,7 +2548,7 @@ static void php_fdfs_storage_get_metadata_impl( \
 		pMetaEnd = meta_list + meta_count;
 		for (pMetaData=meta_list; pMetaData<pMetaEnd; pMetaData++)
 		{
-			add_assoc_stringl_ex(return_value, pMetaData->name, \
+			zend_add_assoc_stringl_ex(return_value, pMetaData->name, \
 				strlen(pMetaData->name)+1, pMetaData->value,\
 				strlen(pMetaData->value), 1);
 		}
@@ -2563,8 +2564,8 @@ static void php_fdfs_storage_file_exist_impl( \
 	int argc;
 	char *group_name;
 	char *remote_filename;
-	int group_nlen;
-	int filename_len;
+	zend_size_t group_nlen;
+	zend_size_t filename_len;
 	zval *tracker_obj;
 	zval *storage_obj;
 	HashTable *tracker_hash;
@@ -2608,7 +2609,7 @@ static void php_fdfs_storage_file_exist_impl( \
 	{
 		char *pSeperator;
 		char *file_id;
-		int file_id_len;
+		zend_size_t file_id_len;
 
 		if (zend_parse_parameters(ZEND_NUM_ARGS() TSRMLS_CC, "s|aa", \
 			&file_id, &file_id_len, &tracker_obj, &storage_obj) \
@@ -2720,8 +2721,8 @@ static void php_fdfs_tracker_query_storage_list_impl( \
 	int argc;
 	char *group_name;
 	char *remote_filename;
-	int group_nlen;
-	int filename_len;
+	zend_size_t group_nlen;
+	zend_size_t filename_len;
 	zval *tracker_obj;
 	zval *server_info_array;
 	HashTable *tracker_hash;
@@ -2764,7 +2765,7 @@ static void php_fdfs_tracker_query_storage_list_impl( \
 	{
 		char *pSeperator;
 		char *file_id;
-		int file_id_len;
+		zend_size_t file_id_len;
 
 		if (zend_parse_parameters(ZEND_NUM_ARGS() TSRMLS_CC, "s|a", \
 			&file_id, &file_id_len, &tracker_obj) == FAILURE)
@@ -2854,12 +2855,12 @@ static void php_fdfs_tracker_query_storage_list_impl( \
 		add_index_zval(return_value, pServer - storage_servers, \
 			server_info_array);
 
-		add_assoc_stringl_ex(server_info_array, "ip_addr", \
+		zend_add_assoc_stringl_ex(server_info_array, "ip_addr", \
 			sizeof("ip_addr"), pServer->ip_addr, \
 			strlen(pServer->ip_addr), 1);
-		add_assoc_long_ex(server_info_array, "port", sizeof("port"), \
+		zend_add_assoc_long_ex(server_info_array, "port", sizeof("port"), \
 			pServer->port);
-		add_assoc_long_ex(server_info_array,"sock",sizeof("sock"),-1);
+		zend_add_assoc_long_ex(server_info_array,"sock",sizeof("sock"),-1);
 	}
 }
 
@@ -2873,23 +2874,23 @@ static int php_fdfs_upload_callback(void *arg, const int64_t file_size, int sock
 	int result;
 	TSRMLS_FETCH();
 
-    INIT_ZVAL(ret);
+	INIT_ZVAL(ret);
 	ZVAL_NULL(&ret);
 
-    INIT_ZVAL(zsock);
+	INIT_ZVAL(zsock);
 	ZVAL_LONG(&zsock, sock);
 
 	pUploadCallback = (php_fdfs_upload_callback_t *)arg;
 	if (pUploadCallback->callback.args == NULL)
 	{
-        INIT_ZVAL(null_args);
+		INIT_ZVAL(null_args);
 		ZVAL_NULL(&null_args);
 		pUploadCallback->callback.args = &null_args;
 	}
 	args[0] = &zsock;
 	args[1] = pUploadCallback->callback.args;
 
-	if (call_user_function(EG(function_table), NULL, \
+	if (zend_call_user_function_wrapper(EG(function_table), NULL, \
 		pUploadCallback->callback.func_name, 
 		&ret, 2, args TSRMLS_CC) == FAILURE)
 	{
@@ -2899,15 +2900,19 @@ static int php_fdfs_upload_callback(void *arg, const int64_t file_size, int sock
 		return EINVAL;
 	}
 
-	if (ret.type == IS_LONG || ret.type == IS_BOOL)
+	if (ZEND_TYPE_OF(&ret) == IS_LONG)
 	{
-		result = ret.value.lval == 0 ? EFAULT : 0;
+		result = ret.value.lval != 0 ? 0 : EFAULT;
+	}
+	else if (ZEND_IS_BOOL(&ret))
+	{
+		result = ZEND_IS_TRUE(&ret) ? 0 : EFAULT;
 	}
 	else
 	{
 		logError("file: "__FILE__", line: %d, " \
 			"callback function return invalid value type: %d", \
-			__LINE__, ret.type);
+			__LINE__, ZEND_TYPE_OF(&ret));
 		result = EINVAL;
 	}
 
@@ -2924,28 +2929,38 @@ static int php_fdfs_download_callback(void *arg, const int64_t file_size, \
 	zval ret;
 	zval null_args;
 	int result;
+#if PHP_MAJOR_VERSION >= 7
+    zend_string *sz_data;
+    bool use_heap_data;
+#endif
+
 	TSRMLS_FETCH();
 
-    INIT_ZVAL(ret);
+	INIT_ZVAL(ret);
 	ZVAL_NULL(&ret);
 
-    INIT_ZVAL(zfilesize);
+	INIT_ZVAL(zfilesize);
 	ZVAL_LONG(&zfilesize, file_size);
 
-    INIT_ZVAL(zdata);
+#if PHP_MAJOR_VERSION < 7
+	INIT_ZVAL(zdata);
 	ZVAL_STRINGL(&zdata, (char *)data, current_size, 0);
+#else
+    ZSTR_ALLOCA_INIT(sz_data, (char *)data, current_size, use_heap_data);
+    ZVAL_NEW_STR(&zdata, sz_data);
+#endif
 
 	pCallback = (php_fdfs_callback_t *)arg;
 	if (pCallback->args == NULL)
 	{
-        INIT_ZVAL(null_args);
+		INIT_ZVAL(null_args);
 		ZVAL_NULL(&null_args);
 		pCallback->args = &null_args;
 	}
 	args[0] = pCallback->args;
 	args[1] = &zfilesize;
 	args[2] = &zdata;
-	if (call_user_function(EG(function_table), NULL, \
+	if (zend_call_user_function_wrapper(EG(function_table), NULL, \
 		pCallback->func_name, 
 		&ret, 3, args TSRMLS_CC) == FAILURE)
 	{
@@ -2955,17 +2970,25 @@ static int php_fdfs_download_callback(void *arg, const int64_t file_size, \
 		return EINVAL;
 	}
 
-	if (ret.type == IS_LONG || ret.type == IS_BOOL)
+	if (ZEND_TYPE_OF(&ret) == IS_LONG)
 	{
-		result = ret.value.lval == 0 ? EFAULT : 0;
+		result = ret.value.lval != 0 ? 0 : EFAULT;
+	}
+	else if (ZEND_IS_BOOL(&ret))
+	{
+		result = ZEND_IS_TRUE(&ret) ? 0 : EFAULT;
 	}
 	else
 	{
 		logError("file: "__FILE__", line: %d, " \
 			"callback function return invalid value type: %d", \
-			__LINE__, ret.type);
+			__LINE__, ZEND_TYPE_OF(&ret));
 		result = EINVAL;
 	}
+
+#if PHP_MAJOR_VERSION >= 7
+    ZSTR_ALLOCA_FREE(sz_data, use_heap_data);
+#endif
 
 	return result;
 }
@@ -2983,7 +3006,7 @@ static void php_fdfs_storage_upload_file_impl(INTERNAL_FUNCTION_PARAMETERS, \
 	int result;
 	int argc;
 	char *local_filename;
-	int filename_len;
+	zend_size_t filename_len;
 	char *file_ext_name;
 	zval *callback_obj;
 	zval *ext_name_obj;
@@ -3052,28 +3075,28 @@ static void php_fdfs_storage_upload_file_impl(INTERNAL_FUNCTION_PARAMETERS, \
 	}
 	else
 	{
-		if (ext_name_obj->type == IS_NULL)
+		if (ZEND_TYPE_OF(ext_name_obj) == IS_NULL)
 		{
 			file_ext_name = NULL;
 		}
-		else if (ext_name_obj->type == IS_STRING)
+		else if (ZEND_TYPE_OF(ext_name_obj) == IS_STRING)
 		{
-			file_ext_name = ext_name_obj->value.str.val;
+			file_ext_name = Z_STRVAL_P(ext_name_obj);
 		}
 		else
 		{
 			logError("file: "__FILE__", line: %d, " \
 				"file_ext_name is not a string, type=%d!", \
-				__LINE__, ext_name_obj->type);
+				__LINE__, ZEND_TYPE_OF(ext_name_obj));
 			pContext->err_no = EINVAL;
 			RETURN_BOOL(false);
 		}
 	}
 
-	if (group_name_obj != NULL && group_name_obj->type == IS_STRING)
+	if (group_name_obj != NULL && ZEND_TYPE_OF(group_name_obj) == IS_STRING)
 	{
 		snprintf(group_name, sizeof(group_name), "%s", \
-			group_name_obj->value.str.val);
+			Z_STRVAL_P(group_name_obj));
 	}
 	else
 	{
@@ -3115,8 +3138,7 @@ static void php_fdfs_storage_upload_file_impl(INTERNAL_FUNCTION_PARAMETERS, \
 	}
 	else
 	{
-		zval **data;
-		zval ***ppp;
+		zval *data;
 
 		pStorageServer = &storage_server;
 		storage_hash = Z_ARRVAL_P(storage_obj);
@@ -3127,10 +3149,8 @@ static void php_fdfs_storage_upload_file_impl(INTERNAL_FUNCTION_PARAMETERS, \
 			RETURN_BOOL(false);
 		}
 
-		data = NULL;
-		ppp = &data;
-		if (zend_hash_find(storage_hash, "store_path_index", \
-			sizeof("store_path_index"), (void **)ppp) == FAILURE)
+		if (zend_hash_find_wrapper(storage_hash, "store_path_index", \
+			sizeof("store_path_index"), &data) == FAILURE)
 		{
 			logError("file: "__FILE__", line: %d, " \
 				"key \"store_path_index\" not exist!", \
@@ -3139,19 +3159,19 @@ static void php_fdfs_storage_upload_file_impl(INTERNAL_FUNCTION_PARAMETERS, \
 			RETURN_BOOL(false);
 		}
 
-		if ((*data)->type == IS_LONG)
+		if (ZEND_TYPE_OF(data) == IS_LONG)
 		{
-			store_path_index = (*data)->value.lval;
+			store_path_index = data->value.lval;
 		}
-		else if ((*data)->type == IS_STRING)
+		else if (ZEND_TYPE_OF(data) == IS_STRING)
 		{
-			store_path_index = atoi(Z_STRVAL_PP(data));
+			store_path_index = atoi(Z_STRVAL_P(data));
 		}
 		else
 		{
 			logError("file: "__FILE__", line: %d, " \
 				"key \"store_path_index\" is invalid, " \
-				"type=%d!", __LINE__, (*data)->type);
+				"type=%d!", __LINE__, ZEND_TYPE_OF(data));
 			pContext->err_no = EINVAL;
 			RETURN_BOOL(false);
 		}
@@ -3246,16 +3266,16 @@ static void php_fdfs_storage_upload_file_impl(INTERNAL_FUNCTION_PARAMETERS, \
 
 		file_id_len = sprintf(file_id, "%s%c%s", group_name, \
 				FDFS_FILE_ID_SEPERATOR, remote_filename);
-		RETURN_STRINGL(file_id, file_id_len, 1);
+		ZEND_RETURN_STRINGL(file_id, file_id_len, 1);
 	}
 	else
 	{
 		array_init(return_value);
 
-		add_assoc_stringl_ex(return_value, "group_name", \
+		zend_add_assoc_stringl_ex(return_value, "group_name", \
 			sizeof("group_name"), group_name, \
 			strlen(group_name), 1);
-		add_assoc_stringl_ex(return_value, "filename", \
+		zend_add_assoc_stringl_ex(return_value, "filename", \
 			sizeof("filename"), remote_filename, \
 			strlen(remote_filename), 1);
 	}
@@ -3285,10 +3305,10 @@ static void php_fdfs_storage_upload_slave_file_impl( \
 	ConnectionInfo *pStorageServer;
 	FDFSMetaData *meta_list;
 	int meta_count;
-	int filename_len;
-	int group_name_len;
-	int master_filename_len;
-	int prefix_name_len;
+	zend_size_t filename_len;
+	zend_size_t group_name_len;
+	zend_size_t master_filename_len;
+	zend_size_t prefix_name_len;
 	int saved_tracker_sock;
 	int saved_storage_sock;
 	int min_param_count;
@@ -3330,7 +3350,7 @@ static void php_fdfs_storage_upload_slave_file_impl( \
 	{
 		char *pSeperator;
 		char *master_file_id;
-		int master_file_id_len;
+		zend_size_t master_file_id_len;
 
 		if (upload_type == FDFS_UPLOAD_BY_CALLBACK)
 		{
@@ -3406,19 +3426,19 @@ static void php_fdfs_storage_upload_slave_file_impl( \
 	}
 	else
 	{
-		if (ext_name_obj->type == IS_NULL)
+		if (ZEND_TYPE_OF(ext_name_obj) == IS_NULL)
 		{
 			file_ext_name = NULL;
 		}
-		else if (ext_name_obj->type == IS_STRING)
+		else if (ZEND_TYPE_OF(ext_name_obj) == IS_STRING)
 		{
-			file_ext_name = ext_name_obj->value.str.val;
+			file_ext_name = Z_STRVAL_P(ext_name_obj);
 		}
 		else
 		{
 			logError("file: "__FILE__", line: %d, " \
 				"file_ext_name is not a string, type=%d!", \
-				__LINE__, ext_name_obj->type);
+				__LINE__, ZEND_TYPE_OF(ext_name_obj));
 			pContext->err_no = EINVAL;
 			RETURN_BOOL(false);
 		}
@@ -3554,16 +3574,16 @@ static void php_fdfs_storage_upload_slave_file_impl( \
 
 		file_id_len = sprintf(file_id, "%s%c%s", new_group_name, \
 				FDFS_FILE_ID_SEPERATOR, remote_filename);
-		RETURN_STRINGL(file_id, file_id_len, 1);
+		ZEND_RETURN_STRINGL(file_id, file_id_len, 1);
 	}
 	else
 	{
 		array_init(return_value);
 
-		add_assoc_stringl_ex(return_value, "group_name", \
+		zend_add_assoc_stringl_ex(return_value, "group_name", \
 			sizeof("group_name"), new_group_name, \
 			strlen(new_group_name), 1);
-		add_assoc_stringl_ex(return_value, "filename", \
+		zend_add_assoc_stringl_ex(return_value, "filename", \
 			sizeof("filename"), remote_filename, \
 			strlen(remote_filename), 1);
 	}
@@ -3594,9 +3614,9 @@ static void php_fdfs_storage_append_file_impl( \
 	ConnectionInfo *pTrackerServer;
 	ConnectionInfo *pStorageServer;
 	char new_file_id[FDFS_GROUP_NAME_MAX_LEN + 128];
-	int filename_len;
-	int group_name_len;
-	int appender_filename_len;
+	zend_size_t filename_len;
+	zend_size_t group_name_len;
+	zend_size_t appender_filename_len;
 	int saved_tracker_sock;
 	int saved_storage_sock;
 	int min_param_count;
@@ -3633,7 +3653,7 @@ static void php_fdfs_storage_append_file_impl( \
 	{
 		char *pSeperator;
 		char *appender_file_id;
-		int appender_file_id_len;
+		zend_size_t appender_file_id_len;
 
 		if (upload_type == FDFS_UPLOAD_BY_CALLBACK)
 		{
@@ -3822,9 +3842,9 @@ static void php_fdfs_storage_modify_file_impl( \
 	ConnectionInfo *pTrackerServer;
 	ConnectionInfo *pStorageServer;
 	char new_file_id[FDFS_GROUP_NAME_MAX_LEN + 128];
-	int filename_len;
-	int group_name_len;
-	int appender_filename_len;
+	zend_size_t filename_len;
+	zend_size_t group_name_len;
+	zend_size_t appender_filename_len;
 	int saved_tracker_sock;
 	int saved_storage_sock;
 	int min_param_count;
@@ -3862,7 +3882,7 @@ static void php_fdfs_storage_modify_file_impl( \
 	{
 		char *pSeperator;
 		char *appender_file_id;
-		int appender_file_id_len;
+		zend_size_t appender_file_id_len;
 
 		if (upload_type == FDFS_UPLOAD_BY_CALLBACK)
 		{
@@ -4039,9 +4059,9 @@ static void php_fdfs_storage_set_metadata_impl(INTERNAL_FUNCTION_PARAMETERS, \
 	char *remote_filename;
 	char *op_type_str;
 	char op_type;
-	int group_nlen;
-	int filename_len;
-	int op_type_len;
+	zend_size_t group_nlen;
+	zend_size_t filename_len;
+	zend_size_t op_type_len;
 	zval *metadata_obj;
 	zval *tracker_obj;
 	zval *storage_obj;
@@ -4089,7 +4109,7 @@ static void php_fdfs_storage_set_metadata_impl(INTERNAL_FUNCTION_PARAMETERS, \
 	{
 		char *pSeperator;
 		char *file_id;
-		int file_id_len;
+		zend_size_t file_id_len;
 
 		if (zend_parse_parameters(ZEND_NUM_ARGS() TSRMLS_CC, "sa|saa", \
 			&file_id, &file_id_len, &metadata_obj, &op_type_str, \
@@ -4246,7 +4266,7 @@ static void php_fdfs_http_gen_token_impl(INTERNAL_FUNCTION_PARAMETERS, \
 	int result;
 	int argc;
 	char *file_id;
-	int file_id_len;
+	zend_size_t file_id_len;
 	long ts;
 	char token[64];
 
@@ -4277,7 +4297,7 @@ static void php_fdfs_http_gen_token_impl(INTERNAL_FUNCTION_PARAMETERS, \
 		RETURN_BOOL(false);
 	}
 
-	RETURN_STRINGL(token, strlen(token), 1);
+	ZEND_RETURN_STRINGL(token, strlen(token), 1);
 }
 
 static void php_fdfs_send_data_impl(INTERNAL_FUNCTION_PARAMETERS, \
@@ -4286,7 +4306,7 @@ static void php_fdfs_send_data_impl(INTERNAL_FUNCTION_PARAMETERS, \
 	int argc;
 	long sock;
 	char *buff;
-	int buff_len;
+	zend_size_t buff_len;
 
     	argc = ZEND_NUM_ARGS();
 	if (argc != 2)
@@ -4323,8 +4343,8 @@ static void php_fdfs_get_file_info_impl(INTERNAL_FUNCTION_PARAMETERS, \
 	int argc;
 	char *group_name;
 	char *remote_filename;
-	int group_nlen;
-	int filename_len;
+	zend_size_t group_nlen;
+	zend_size_t filename_len;
 	int param_count;
 	FDFSFileInfo file_info;
 	char new_file_id[FDFS_GROUP_NAME_MAX_LEN + 128];
@@ -4352,7 +4372,7 @@ static void php_fdfs_get_file_info_impl(INTERNAL_FUNCTION_PARAMETERS, \
 	{
 		char *pSeperator;
 		char *file_id;
-		int file_id_len;
+		zend_size_t file_id_len;
 
 		if (zend_parse_parameters(ZEND_NUM_ARGS() TSRMLS_CC, "s", \
 			&file_id, &file_id_len) == FAILURE)
@@ -4399,16 +4419,16 @@ static void php_fdfs_get_file_info_impl(INTERNAL_FUNCTION_PARAMETERS, \
 	}
 
 	array_init(return_value);
-	add_assoc_long_ex(return_value, "source_id", \
+	zend_add_assoc_long_ex(return_value, "source_id", \
 		sizeof("source_id"), file_info.source_id);
-	add_assoc_long_ex(return_value, "create_timestamp", \
+	zend_add_assoc_long_ex(return_value, "create_timestamp", \
 		sizeof("create_timestamp"), file_info.create_timestamp);
-	add_assoc_long_ex(return_value, "file_size", \
+	zend_add_assoc_long_ex(return_value, "file_size", \
 		sizeof("file_size"), (long)file_info.file_size);
-	add_assoc_stringl_ex(return_value, "source_ip_addr", \
+	zend_add_assoc_stringl_ex(return_value, "source_ip_addr", \
 		sizeof("source_ip_addr"), file_info.source_ip_addr, \
 		strlen(file_info.source_ip_addr), 1);
-	add_assoc_long_ex(return_value, "crc32", \
+	zend_add_assoc_long_ex(return_value, "crc32", \
 		sizeof("crc32"), file_info.crc32);
 }
 
@@ -4423,9 +4443,9 @@ static void php_fdfs_gen_slave_filename_impl(INTERNAL_FUNCTION_PARAMETERS, \
 	int result;
 	int argc;
 	char *master_filename;
-	int master_filename_len;
+	zend_size_t master_filename_len;
 	char *prefix_name;
-	int prefix_name_len;
+	zend_size_t prefix_name_len;
 	int filename_len;
 	zval *ext_name_obj;
 	char *file_ext_name;
@@ -4460,21 +4480,21 @@ static void php_fdfs_gen_slave_filename_impl(INTERNAL_FUNCTION_PARAMETERS, \
 	}
 	else
 	{
-		if (ext_name_obj->type == IS_NULL)
+		if (ZEND_TYPE_OF(ext_name_obj) == IS_NULL)
 		{
 			file_ext_name = NULL;
 			file_ext_name_len = 0;
 		}
-		else if (ext_name_obj->type == IS_STRING)
+		else if (ZEND_TYPE_OF(ext_name_obj) == IS_STRING)
 		{
-			file_ext_name = ext_name_obj->value.str.val;
-			file_ext_name_len = ext_name_obj->value.str.len;
+			file_ext_name = Z_STRVAL_P(ext_name_obj);
+			file_ext_name_len = Z_STRLEN_P(ext_name_obj);
 		}
 		else
 		{
 			logError("file: "__FILE__", line: %d, " \
 				"file_ext_name is not a string, type=%d!", \
-				__LINE__, ext_name_obj->type);
+				__LINE__, ZEND_TYPE_OF(ext_name_obj));
 			pContext->err_no = EINVAL;
 			RETURN_BOOL(false);
 		}
@@ -4497,7 +4517,7 @@ static void php_fdfs_gen_slave_filename_impl(INTERNAL_FUNCTION_PARAMETERS, \
 		RETURN_BOOL(false);
 	}
 
-	RETURN_STRINGL(filename, filename_len, 1);
+	ZEND_RETURN_STRINGL(filename, filename_len, 1);
 }
 
 /*
@@ -4578,7 +4598,7 @@ ZEND_FUNCTION(fastdfs_get_last_error_info)
 	char *error_info;
 
 	error_info = STRERROR(php_context.err_no);
-	RETURN_STRINGL(error_info, strlen(error_info), 1);
+	ZEND_RETURN_STRINGL(error_info, strlen(error_info), 1);
 }
 
 /*
@@ -4593,7 +4613,7 @@ ZEND_FUNCTION(fastdfs_client_version)
 	len = sprintf(szVersion, "%d.%02d", \
 		g_fdfs_version.major, g_fdfs_version.minor);
 
-	RETURN_STRINGL(szVersion, len, 1);
+	ZEND_RETURN_STRINGL(szVersion, len, 1);
 }
 
 /*
@@ -5342,7 +5362,6 @@ static void php_fdfs_close(php_fdfs_t *i_obj TSRMLS_DC)
 	}
 }
 
-/* constructor/destructor */
 static void php_fdfs_destroy(php_fdfs_t *i_obj TSRMLS_DC)
 {
 	php_fdfs_close(i_obj TSRMLS_CC);
@@ -5359,12 +5378,22 @@ static void php_fdfs_destroy(php_fdfs_t *i_obj TSRMLS_DC)
 
 ZEND_RSRC_DTOR_FUNC(php_fdfs_dtor)
 {
+#if PHP_MAJOR_VERSION < 7
 	if (rsrc->ptr != NULL)
 	{
 		php_fdfs_t *i_obj = (php_fdfs_t *)rsrc->ptr;
 		php_fdfs_destroy(i_obj TSRMLS_CC);
 		rsrc->ptr = NULL;
 	}
+#else
+	if (res->ptr != NULL)
+	{
+		php_fdfs_t *i_obj = (php_fdfs_t *)res->ptr;
+		php_fdfs_destroy(i_obj TSRMLS_CC);
+		res->ptr = NULL;
+	}
+#endif
+
 }
 
 /* FastDFS::__construct([int config_index = 0, bool bMultiThread = false])
@@ -5374,7 +5403,7 @@ static PHP_METHOD(FastDFS, __construct)
 	long config_index;
 	bool bMultiThread;
 	zval *object = getThis();
-	php_fdfs_t *i_obj;
+	php_fdfs_t *i_obj = NULL;
 
 	config_index = 0;
 	bMultiThread = false;
@@ -5396,7 +5425,7 @@ static PHP_METHOD(FastDFS, __construct)
 		return;
 	}
 
-	i_obj = (php_fdfs_t *) zend_object_store_get_object(object TSRMLS_CC);
+	i_obj = (php_fdfs_t *) fdfs_get_object(object);
 	i_obj->pConfigInfo = config_list + config_index;
 	i_obj->context.err_no = 0;
 	if (bMultiThread)
@@ -5425,6 +5454,15 @@ static PHP_METHOD(FastDFS, __construct)
 	}
 }
 
+static PHP_METHOD(FastDFS, __destruct)
+{
+	zval *object = getThis();
+	php_fdfs_t *i_obj;
+
+	i_obj = (php_fdfs_t *) fdfs_get_object(object);
+	php_fdfs_free_storage(i_obj);
+}
+
 /*
 array FastDFS::tracker_get_connection()
 return array for success, false for error
@@ -5434,7 +5472,7 @@ PHP_METHOD(FastDFS, tracker_get_connection)
 	zval *object = getThis();
 	php_fdfs_t *i_obj;
 
-	i_obj = (php_fdfs_t *) zend_object_store_get_object(object TSRMLS_CC);
+	i_obj = (php_fdfs_t *) fdfs_get_object(object);
 	php_fdfs_tracker_get_connection_impl(INTERNAL_FUNCTION_PARAM_PASSTHRU, \
 			&(i_obj->context));
 }
@@ -5448,7 +5486,7 @@ PHP_METHOD(FastDFS, tracker_make_all_connections)
 	zval *object = getThis();
 	php_fdfs_t *i_obj;
 
-	i_obj = (php_fdfs_t *) zend_object_store_get_object(object TSRMLS_CC);
+	i_obj = (php_fdfs_t *) fdfs_get_object(object);
 	php_fdfs_tracker_make_all_connections_impl( \
 		INTERNAL_FUNCTION_PARAM_PASSTHRU, &(i_obj->context));
 }
@@ -5462,7 +5500,7 @@ PHP_METHOD(FastDFS, tracker_close_all_connections)
 	zval *object = getThis();
 	php_fdfs_t *i_obj;
 
-	i_obj = (php_fdfs_t *) zend_object_store_get_object(object TSRMLS_CC);
+	i_obj = (php_fdfs_t *) fdfs_get_object(object);
 	php_fdfs_tracker_close_all_connections_impl( \
 		INTERNAL_FUNCTION_PARAM_PASSTHRU, &(i_obj->context));
 }
@@ -5476,7 +5514,7 @@ PHP_METHOD(FastDFS, connect_server)
 	zval *object = getThis();
 	php_fdfs_t *i_obj;
 
-	i_obj = (php_fdfs_t *) zend_object_store_get_object(object TSRMLS_CC);
+	i_obj = (php_fdfs_t *) fdfs_get_object(object);
 	php_fdfs_connect_server_impl(INTERNAL_FUNCTION_PARAM_PASSTHRU, \
 		&(i_obj->context));
 }
@@ -5490,7 +5528,7 @@ PHP_METHOD(FastDFS, disconnect_server)
 	zval *object = getThis();
 	php_fdfs_t *i_obj;
 
-	i_obj = (php_fdfs_t *) zend_object_store_get_object(object TSRMLS_CC);
+	i_obj = (php_fdfs_t *) fdfs_get_object(object);
 	php_fdfs_disconnect_server_impl(INTERNAL_FUNCTION_PARAM_PASSTHRU, \
 		&(i_obj->context));
 }
@@ -5504,7 +5542,7 @@ PHP_METHOD(FastDFS, active_test)
 	zval *object = getThis();
 	php_fdfs_t *i_obj;
 
-	i_obj = (php_fdfs_t *) zend_object_store_get_object(object TSRMLS_CC);
+	i_obj = (php_fdfs_t *) fdfs_get_object(object);
 	php_fastdfs_active_test_impl(INTERNAL_FUNCTION_PARAM_PASSTHRU, \
 		&(i_obj->context));
 }
@@ -5518,7 +5556,7 @@ PHP_METHOD(FastDFS, tracker_list_groups)
 	zval *object = getThis();
 	php_fdfs_t *i_obj;
 
-	i_obj = (php_fdfs_t *) zend_object_store_get_object(object TSRMLS_CC);
+	i_obj = (php_fdfs_t *) fdfs_get_object(object);
 	php_fdfs_tracker_list_groups_impl(INTERNAL_FUNCTION_PARAM_PASSTHRU, \
 			&(i_obj->context));
 }
@@ -5533,7 +5571,7 @@ PHP_METHOD(FastDFS, tracker_query_storage_store)
 	zval *object = getThis();
 	php_fdfs_t *i_obj;
 
-	i_obj = (php_fdfs_t *) zend_object_store_get_object(object TSRMLS_CC);
+	i_obj = (php_fdfs_t *) fdfs_get_object(object);
 	php_fdfs_tracker_query_storage_store_impl( \
 			INTERNAL_FUNCTION_PARAM_PASSTHRU, \
 			&(i_obj->context));
@@ -5549,7 +5587,7 @@ PHP_METHOD(FastDFS, tracker_query_storage_store_list)
 	zval *object = getThis();
 	php_fdfs_t *i_obj;
 
-	i_obj = (php_fdfs_t *) zend_object_store_get_object(object TSRMLS_CC);
+	i_obj = (php_fdfs_t *) fdfs_get_object(object);
 	php_fdfs_tracker_query_storage_store_list_impl( \
 			INTERNAL_FUNCTION_PARAM_PASSTHRU, \
 			&(i_obj->context));
@@ -5565,7 +5603,7 @@ PHP_METHOD(FastDFS, tracker_query_storage_update)
 	zval *object = getThis();
 	php_fdfs_t *i_obj;
 
-	i_obj = (php_fdfs_t *) zend_object_store_get_object(object TSRMLS_CC);
+	i_obj = (php_fdfs_t *) fdfs_get_object(object);
 	php_fdfs_tracker_do_query_storage_impl( \
 		INTERNAL_FUNCTION_PARAM_PASSTHRU, &(i_obj->context), \
 		TRACKER_PROTO_CMD_SERVICE_QUERY_UPDATE, false);
@@ -5581,7 +5619,7 @@ PHP_METHOD(FastDFS, tracker_query_storage_fetch)
 	zval *object = getThis();
 	php_fdfs_t *i_obj;
 
-	i_obj = (php_fdfs_t *) zend_object_store_get_object(object TSRMLS_CC);
+	i_obj = (php_fdfs_t *) fdfs_get_object(object);
 	php_fdfs_tracker_do_query_storage_impl( \
 		INTERNAL_FUNCTION_PARAM_PASSTHRU, &(i_obj->context), \
 		TRACKER_PROTO_CMD_SERVICE_QUERY_FETCH_ONE, false);
@@ -5597,7 +5635,7 @@ PHP_METHOD(FastDFS, tracker_query_storage_list)
 	zval *object = getThis();
 	php_fdfs_t *i_obj;
 
-	i_obj = (php_fdfs_t *) zend_object_store_get_object(object TSRMLS_CC);
+	i_obj = (php_fdfs_t *) fdfs_get_object(object);
 	php_fdfs_tracker_query_storage_list_impl( \
 		INTERNAL_FUNCTION_PARAM_PASSTHRU, &(i_obj->context), false);
 }
@@ -5611,7 +5649,7 @@ PHP_METHOD(FastDFS, tracker_delete_storage)
 	zval *object = getThis();
 	php_fdfs_t *i_obj;
 
-	i_obj = (php_fdfs_t *) zend_object_store_get_object(object TSRMLS_CC);
+	i_obj = (php_fdfs_t *) fdfs_get_object(object);
 	php_fdfs_tracker_delete_storage_impl( \
 		INTERNAL_FUNCTION_PARAM_PASSTHRU, &(i_obj->context));
 }
@@ -5626,7 +5664,7 @@ PHP_METHOD(FastDFS, tracker_query_storage_update1)
 	zval *object = getThis();
 	php_fdfs_t *i_obj;
 
-	i_obj = (php_fdfs_t *) zend_object_store_get_object(object TSRMLS_CC);
+	i_obj = (php_fdfs_t *) fdfs_get_object(object);
 	php_fdfs_tracker_do_query_storage_impl( \
 		INTERNAL_FUNCTION_PARAM_PASSTHRU, &(i_obj->context), \
 		TRACKER_PROTO_CMD_SERVICE_QUERY_UPDATE, true);
@@ -5642,7 +5680,7 @@ PHP_METHOD(FastDFS, tracker_query_storage_fetch1)
 	zval *object = getThis();
 	php_fdfs_t *i_obj;
 
-	i_obj = (php_fdfs_t *) zend_object_store_get_object(object TSRMLS_CC);
+	i_obj = (php_fdfs_t *) fdfs_get_object(object);
 	php_fdfs_tracker_do_query_storage_impl( \
 		INTERNAL_FUNCTION_PARAM_PASSTHRU, &(i_obj->context), \
 		TRACKER_PROTO_CMD_SERVICE_QUERY_FETCH_ONE, true);
@@ -5658,7 +5696,7 @@ PHP_METHOD(FastDFS, tracker_query_storage_list1)
 	zval *object = getThis();
 	php_fdfs_t *i_obj;
 
-	i_obj = (php_fdfs_t *) zend_object_store_get_object(object TSRMLS_CC);
+	i_obj = (php_fdfs_t *) fdfs_get_object(object);
 	php_fdfs_tracker_query_storage_list_impl( \
 		INTERNAL_FUNCTION_PARAM_PASSTHRU, &(i_obj->context), true);
 }
@@ -5674,7 +5712,7 @@ PHP_METHOD(FastDFS, storage_upload_by_filename)
 	zval *object = getThis();
 	php_fdfs_t *i_obj;
 
-	i_obj = (php_fdfs_t *) zend_object_store_get_object(object TSRMLS_CC);
+	i_obj = (php_fdfs_t *) fdfs_get_object(object);
 	php_fdfs_storage_upload_file_impl(INTERNAL_FUNCTION_PARAM_PASSTHRU, \
 		&(i_obj->context), STORAGE_PROTO_CMD_UPLOAD_FILE, \
 		FDFS_UPLOAD_BY_FILE, false);
@@ -5691,7 +5729,7 @@ PHP_METHOD(FastDFS, storage_upload_by_filename1)
 	zval *object = getThis();
 	php_fdfs_t *i_obj;
 
-	i_obj = (php_fdfs_t *) zend_object_store_get_object(object TSRMLS_CC);
+	i_obj = (php_fdfs_t *) fdfs_get_object(object);
 	php_fdfs_storage_upload_file_impl(INTERNAL_FUNCTION_PARAM_PASSTHRU, \
 		&(i_obj->context), STORAGE_PROTO_CMD_UPLOAD_FILE, \
 		FDFS_UPLOAD_BY_FILE, true);
@@ -5708,7 +5746,7 @@ PHP_METHOD(FastDFS, storage_upload_by_filebuff)
 	zval *object = getThis();
 	php_fdfs_t *i_obj;
 
-	i_obj = (php_fdfs_t *) zend_object_store_get_object(object TSRMLS_CC);
+	i_obj = (php_fdfs_t *) fdfs_get_object(object);
 	php_fdfs_storage_upload_file_impl(INTERNAL_FUNCTION_PARAM_PASSTHRU, \
 		&(i_obj->context), STORAGE_PROTO_CMD_UPLOAD_FILE, \
 		FDFS_UPLOAD_BY_BUFF, false);
@@ -5725,7 +5763,7 @@ PHP_METHOD(FastDFS, storage_upload_by_filebuff1)
 	zval *object = getThis();
 	php_fdfs_t *i_obj;
 
-	i_obj = (php_fdfs_t *) zend_object_store_get_object(object TSRMLS_CC);
+	i_obj = (php_fdfs_t *) fdfs_get_object(object);
 	php_fdfs_storage_upload_file_impl(INTERNAL_FUNCTION_PARAM_PASSTHRU, \
 		&(i_obj->context), STORAGE_PROTO_CMD_UPLOAD_FILE, \
 		FDFS_UPLOAD_BY_BUFF, true);
@@ -5742,7 +5780,7 @@ PHP_METHOD(FastDFS, storage_upload_by_callback)
 	zval *object = getThis();
 	php_fdfs_t *i_obj;
 
-	i_obj = (php_fdfs_t *) zend_object_store_get_object(object TSRMLS_CC);
+	i_obj = (php_fdfs_t *) fdfs_get_object(object);
 	php_fdfs_storage_upload_file_impl(INTERNAL_FUNCTION_PARAM_PASSTHRU, \
 		&(i_obj->context), STORAGE_PROTO_CMD_UPLOAD_FILE, \
 		FDFS_UPLOAD_BY_CALLBACK, false);
@@ -5759,7 +5797,7 @@ PHP_METHOD(FastDFS, storage_upload_by_callback1)
 	zval *object = getThis();
 	php_fdfs_t *i_obj;
 
-	i_obj = (php_fdfs_t *) zend_object_store_get_object(object TSRMLS_CC);
+	i_obj = (php_fdfs_t *) fdfs_get_object(object);
 	php_fdfs_storage_upload_file_impl(INTERNAL_FUNCTION_PARAM_PASSTHRU, \
 		&(i_obj->context), STORAGE_PROTO_CMD_UPLOAD_FILE, \
 		FDFS_UPLOAD_BY_CALLBACK, true);
@@ -5776,7 +5814,7 @@ PHP_METHOD(FastDFS, storage_append_by_filename)
 	zval *object = getThis();
 	php_fdfs_t *i_obj;
 
-	i_obj = (php_fdfs_t *) zend_object_store_get_object(object TSRMLS_CC);
+	i_obj = (php_fdfs_t *) fdfs_get_object(object);
 	php_fdfs_storage_append_file_impl(INTERNAL_FUNCTION_PARAM_PASSTHRU, \
 		&(i_obj->context), FDFS_UPLOAD_BY_FILE, false);
 }
@@ -5792,7 +5830,7 @@ PHP_METHOD(FastDFS, storage_append_by_filename1)
 	zval *object = getThis();
 	php_fdfs_t *i_obj;
 
-	i_obj = (php_fdfs_t *) zend_object_store_get_object(object TSRMLS_CC);
+	i_obj = (php_fdfs_t *) fdfs_get_object(object);
 	php_fdfs_storage_append_file_impl(INTERNAL_FUNCTION_PARAM_PASSTHRU, \
 		&(i_obj->context), FDFS_UPLOAD_BY_FILE, true);
 }
@@ -5808,7 +5846,7 @@ PHP_METHOD(FastDFS, storage_append_by_filebuff)
 	zval *object = getThis();
 	php_fdfs_t *i_obj;
 
-	i_obj = (php_fdfs_t *) zend_object_store_get_object(object TSRMLS_CC);
+	i_obj = (php_fdfs_t *) fdfs_get_object(object);
 	php_fdfs_storage_append_file_impl(INTERNAL_FUNCTION_PARAM_PASSTHRU, \
 		&(i_obj->context), FDFS_UPLOAD_BY_BUFF, false);
 }
@@ -5824,7 +5862,7 @@ PHP_METHOD(FastDFS, storage_append_by_filebuff1)
 	zval *object = getThis();
 	php_fdfs_t *i_obj;
 
-	i_obj = (php_fdfs_t *) zend_object_store_get_object(object TSRMLS_CC);
+	i_obj = (php_fdfs_t *) fdfs_get_object(object);
 	php_fdfs_storage_append_file_impl(INTERNAL_FUNCTION_PARAM_PASSTHRU, \
 		&(i_obj->context), FDFS_UPLOAD_BY_BUFF, true);
 }
@@ -5840,7 +5878,7 @@ PHP_METHOD(FastDFS, storage_append_by_callback)
 	zval *object = getThis();
 	php_fdfs_t *i_obj;
 
-	i_obj = (php_fdfs_t *) zend_object_store_get_object(object TSRMLS_CC);
+	i_obj = (php_fdfs_t *) fdfs_get_object(object);
 	php_fdfs_storage_append_file_impl(INTERNAL_FUNCTION_PARAM_PASSTHRU, \
 		&(i_obj->context), FDFS_UPLOAD_BY_CALLBACK, false);
 }
@@ -5856,7 +5894,7 @@ PHP_METHOD(FastDFS, storage_append_by_callback1)
 	zval *object = getThis();
 	php_fdfs_t *i_obj;
 
-	i_obj = (php_fdfs_t *) zend_object_store_get_object(object TSRMLS_CC);
+	i_obj = (php_fdfs_t *) fdfs_get_object(object);
 	php_fdfs_storage_append_file_impl(INTERNAL_FUNCTION_PARAM_PASSTHRU, \
 		&(i_obj->context), FDFS_UPLOAD_BY_CALLBACK, true);
 }
@@ -5873,7 +5911,7 @@ PHP_METHOD(FastDFS, storage_modify_by_filename)
 	zval *object = getThis();
 	php_fdfs_t *i_obj;
 
-	i_obj = (php_fdfs_t *) zend_object_store_get_object(object TSRMLS_CC);
+	i_obj = (php_fdfs_t *) fdfs_get_object(object);
 	php_fdfs_storage_modify_file_impl(INTERNAL_FUNCTION_PARAM_PASSTHRU, \
 		&(i_obj->context), FDFS_UPLOAD_BY_FILE, false);
 }
@@ -5889,7 +5927,7 @@ PHP_METHOD(FastDFS, storage_modify_by_filename1)
 	zval *object = getThis();
 	php_fdfs_t *i_obj;
 
-	i_obj = (php_fdfs_t *) zend_object_store_get_object(object TSRMLS_CC);
+	i_obj = (php_fdfs_t *) fdfs_get_object(object);
 	php_fdfs_storage_modify_file_impl(INTERNAL_FUNCTION_PARAM_PASSTHRU, \
 		&(i_obj->context), FDFS_UPLOAD_BY_FILE, true);
 }
@@ -5905,7 +5943,7 @@ PHP_METHOD(FastDFS, storage_modify_by_filebuff)
 	zval *object = getThis();
 	php_fdfs_t *i_obj;
 
-	i_obj = (php_fdfs_t *) zend_object_store_get_object(object TSRMLS_CC);
+	i_obj = (php_fdfs_t *) fdfs_get_object(object);
 	php_fdfs_storage_modify_file_impl(INTERNAL_FUNCTION_PARAM_PASSTHRU, \
 		&(i_obj->context), FDFS_UPLOAD_BY_BUFF, false);
 }
@@ -5921,7 +5959,7 @@ PHP_METHOD(FastDFS, storage_modify_by_filebuff1)
 	zval *object = getThis();
 	php_fdfs_t *i_obj;
 
-	i_obj = (php_fdfs_t *) zend_object_store_get_object(object TSRMLS_CC);
+	i_obj = (php_fdfs_t *) fdfs_get_object(object);
 	php_fdfs_storage_modify_file_impl(INTERNAL_FUNCTION_PARAM_PASSTHRU, \
 		&(i_obj->context), FDFS_UPLOAD_BY_BUFF, true);
 }
@@ -5937,7 +5975,7 @@ PHP_METHOD(FastDFS, storage_modify_by_callback)
 	zval *object = getThis();
 	php_fdfs_t *i_obj;
 
-	i_obj = (php_fdfs_t *) zend_object_store_get_object(object TSRMLS_CC);
+	i_obj = (php_fdfs_t *) fdfs_get_object(object);
 	php_fdfs_storage_modify_file_impl(INTERNAL_FUNCTION_PARAM_PASSTHRU, \
 		&(i_obj->context), FDFS_UPLOAD_BY_CALLBACK, false);
 }
@@ -5953,7 +5991,7 @@ PHP_METHOD(FastDFS, storage_modify_by_callback1)
 	zval *object = getThis();
 	php_fdfs_t *i_obj;
 
-	i_obj = (php_fdfs_t *) zend_object_store_get_object(object TSRMLS_CC);
+	i_obj = (php_fdfs_t *) fdfs_get_object(object);
 	php_fdfs_storage_modify_file_impl(INTERNAL_FUNCTION_PARAM_PASSTHRU, \
 		&(i_obj->context), FDFS_UPLOAD_BY_CALLBACK, true);
 }
@@ -5969,7 +6007,7 @@ PHP_METHOD(FastDFS, storage_upload_appender_by_filename)
 	zval *object = getThis();
 	php_fdfs_t *i_obj;
 
-	i_obj = (php_fdfs_t *) zend_object_store_get_object(object TSRMLS_CC);
+	i_obj = (php_fdfs_t *) fdfs_get_object(object);
 	php_fdfs_storage_upload_file_impl(INTERNAL_FUNCTION_PARAM_PASSTHRU, \
 		&(i_obj->context), STORAGE_PROTO_CMD_UPLOAD_APPENDER_FILE, \
 		FDFS_UPLOAD_BY_FILE, false);
@@ -5986,7 +6024,7 @@ PHP_METHOD(FastDFS, storage_upload_appender_by_filename1)
 	zval *object = getThis();
 	php_fdfs_t *i_obj;
 
-	i_obj = (php_fdfs_t *) zend_object_store_get_object(object TSRMLS_CC);
+	i_obj = (php_fdfs_t *) fdfs_get_object(object);
 	php_fdfs_storage_upload_file_impl(INTERNAL_FUNCTION_PARAM_PASSTHRU, \
 		&(i_obj->context), STORAGE_PROTO_CMD_UPLOAD_APPENDER_FILE, \
 		FDFS_UPLOAD_BY_FILE, true);
@@ -6003,7 +6041,7 @@ PHP_METHOD(FastDFS, storage_upload_appender_by_filebuff)
 	zval *object = getThis();
 	php_fdfs_t *i_obj;
 
-	i_obj = (php_fdfs_t *) zend_object_store_get_object(object TSRMLS_CC);
+	i_obj = (php_fdfs_t *) fdfs_get_object(object);
 	php_fdfs_storage_upload_file_impl(INTERNAL_FUNCTION_PARAM_PASSTHRU, \
 		&(i_obj->context), STORAGE_PROTO_CMD_UPLOAD_APPENDER_FILE, \
 		FDFS_UPLOAD_BY_BUFF, false);
@@ -6020,7 +6058,7 @@ PHP_METHOD(FastDFS, storage_upload_appender_by_filebuff1)
 	zval *object = getThis();
 	php_fdfs_t *i_obj;
 
-	i_obj = (php_fdfs_t *) zend_object_store_get_object(object TSRMLS_CC);
+	i_obj = (php_fdfs_t *) fdfs_get_object(object);
 	php_fdfs_storage_upload_file_impl(INTERNAL_FUNCTION_PARAM_PASSTHRU, \
 		&(i_obj->context), STORAGE_PROTO_CMD_UPLOAD_APPENDER_FILE, \
 		FDFS_UPLOAD_BY_BUFF, true);
@@ -6037,7 +6075,7 @@ PHP_METHOD(FastDFS, storage_upload_appender_by_callback)
 	zval *object = getThis();
 	php_fdfs_t *i_obj;
 
-	i_obj = (php_fdfs_t *) zend_object_store_get_object(object TSRMLS_CC);
+	i_obj = (php_fdfs_t *) fdfs_get_object(object);
 	php_fdfs_storage_upload_file_impl(INTERNAL_FUNCTION_PARAM_PASSTHRU, \
 		&(i_obj->context), STORAGE_PROTO_CMD_UPLOAD_APPENDER_FILE, \
 		FDFS_UPLOAD_BY_CALLBACK, false);
@@ -6054,7 +6092,7 @@ PHP_METHOD(FastDFS, storage_upload_appender_by_callback1)
 	zval *object = getThis();
 	php_fdfs_t *i_obj;
 
-	i_obj = (php_fdfs_t *) zend_object_store_get_object(object TSRMLS_CC);
+	i_obj = (php_fdfs_t *) fdfs_get_object(object);
 	php_fdfs_storage_upload_file_impl(INTERNAL_FUNCTION_PARAM_PASSTHRU, \
 		&(i_obj->context), STORAGE_PROTO_CMD_UPLOAD_APPENDER_FILE, \
 		FDFS_UPLOAD_BY_CALLBACK, true);
@@ -6073,7 +6111,7 @@ PHP_METHOD(FastDFS, storage_upload_slave_by_filename)
 	zval *object = getThis();
 	php_fdfs_t *i_obj;
 
-	i_obj = (php_fdfs_t *) zend_object_store_get_object(object TSRMLS_CC);
+	i_obj = (php_fdfs_t *) fdfs_get_object(object);
 	php_fdfs_storage_upload_slave_file_impl( \
 		INTERNAL_FUNCTION_PARAM_PASSTHRU, &(i_obj->context), \
 		FDFS_UPLOAD_BY_FILE, false);
@@ -6091,7 +6129,7 @@ PHP_METHOD(FastDFS, storage_upload_slave_by_filename1)
 	zval *object = getThis();
 	php_fdfs_t *i_obj;
 
-	i_obj = (php_fdfs_t *) zend_object_store_get_object(object TSRMLS_CC);
+	i_obj = (php_fdfs_t *) fdfs_get_object(object);
 	php_fdfs_storage_upload_slave_file_impl( \
 		INTERNAL_FUNCTION_PARAM_PASSTHRU, &(i_obj->context), \
 		FDFS_UPLOAD_BY_FILE, true);
@@ -6109,7 +6147,7 @@ PHP_METHOD(FastDFS, storage_upload_slave_by_filebuff)
 	zval *object = getThis();
 	php_fdfs_t *i_obj;
 
-	i_obj = (php_fdfs_t *) zend_object_store_get_object(object TSRMLS_CC);
+	i_obj = (php_fdfs_t *) fdfs_get_object(object);
 	php_fdfs_storage_upload_slave_file_impl( \
 		INTERNAL_FUNCTION_PARAM_PASSTHRU, &(i_obj->context), \
 		FDFS_UPLOAD_BY_BUFF, false);
@@ -6126,7 +6164,7 @@ PHP_METHOD(FastDFS, storage_upload_slave_by_filebuff1)
 	zval *object = getThis();
 	php_fdfs_t *i_obj;
 
-	i_obj = (php_fdfs_t *) zend_object_store_get_object(object TSRMLS_CC);
+	i_obj = (php_fdfs_t *) fdfs_get_object(object);
 	php_fdfs_storage_upload_slave_file_impl( \
 		INTERNAL_FUNCTION_PARAM_PASSTHRU, &(i_obj->context), \
 		FDFS_UPLOAD_BY_BUFF, true);
@@ -6144,7 +6182,7 @@ PHP_METHOD(FastDFS, storage_upload_slave_by_callback)
 	zval *object = getThis();
 	php_fdfs_t *i_obj;
 
-	i_obj = (php_fdfs_t *) zend_object_store_get_object(object TSRMLS_CC);
+	i_obj = (php_fdfs_t *) fdfs_get_object(object);
 	php_fdfs_storage_upload_slave_file_impl( \
 		INTERNAL_FUNCTION_PARAM_PASSTHRU, &(i_obj->context), \
 		FDFS_UPLOAD_BY_CALLBACK, false);
@@ -6162,7 +6200,7 @@ PHP_METHOD(FastDFS, storage_upload_slave_by_callback1)
 	zval *object = getThis();
 	php_fdfs_t *i_obj;
 
-	i_obj = (php_fdfs_t *) zend_object_store_get_object(object TSRMLS_CC);
+	i_obj = (php_fdfs_t *) fdfs_get_object(object);
 	php_fdfs_storage_upload_slave_file_impl( \
 		INTERNAL_FUNCTION_PARAM_PASSTHRU, &(i_obj->context), \
 		FDFS_UPLOAD_BY_CALLBACK, true);
@@ -6178,7 +6216,7 @@ PHP_METHOD(FastDFS, storage_delete_file)
 	zval *object = getThis();
 	php_fdfs_t *i_obj;
 
-	i_obj = (php_fdfs_t *) zend_object_store_get_object(object TSRMLS_CC);
+	i_obj = (php_fdfs_t *) fdfs_get_object(object);
 	php_fdfs_storage_delete_file_impl(INTERNAL_FUNCTION_PARAM_PASSTHRU, \
 		&(i_obj->context), false);
 }
@@ -6193,7 +6231,7 @@ PHP_METHOD(FastDFS, storage_delete_file1)
 	zval *object = getThis();
 	php_fdfs_t *i_obj;
 
-	i_obj = (php_fdfs_t *) zend_object_store_get_object(object TSRMLS_CC);
+	i_obj = (php_fdfs_t *) fdfs_get_object(object);
 	php_fdfs_storage_delete_file_impl(INTERNAL_FUNCTION_PARAM_PASSTHRU, \
 		&(i_obj->context), true);
 }
@@ -6209,7 +6247,7 @@ PHP_METHOD(FastDFS, storage_truncate_file)
 	zval *object = getThis();
 	php_fdfs_t *i_obj;
 
-	i_obj = (php_fdfs_t *) zend_object_store_get_object(object TSRMLS_CC);
+	i_obj = (php_fdfs_t *) fdfs_get_object(object);
 	php_fdfs_storage_truncate_file_impl(INTERNAL_FUNCTION_PARAM_PASSTHRU, \
 		&(i_obj->context), false);
 }
@@ -6225,7 +6263,7 @@ PHP_METHOD(FastDFS, storage_truncate_file1)
 	zval *object = getThis();
 	php_fdfs_t *i_obj;
 
-	i_obj = (php_fdfs_t *) zend_object_store_get_object(object TSRMLS_CC);
+	i_obj = (php_fdfs_t *) fdfs_get_object(object);
 	php_fdfs_storage_truncate_file_impl(INTERNAL_FUNCTION_PARAM_PASSTHRU, \
 		&(i_obj->context), true);
 }
@@ -6241,7 +6279,7 @@ PHP_METHOD(FastDFS, storage_download_file_to_buff)
 	zval *object = getThis();
 	php_fdfs_t *i_obj;
 
-	i_obj = (php_fdfs_t *) zend_object_store_get_object(object TSRMLS_CC);
+	i_obj = (php_fdfs_t *) fdfs_get_object(object);
 	php_fdfs_storage_download_file_to_buff_impl( \
 		INTERNAL_FUNCTION_PARAM_PASSTHRU, &(i_obj->context), false);
 }
@@ -6257,7 +6295,7 @@ PHP_METHOD(FastDFS, storage_download_file_to_buff1)
 	zval *object = getThis();
 	php_fdfs_t *i_obj;
 
-	i_obj = (php_fdfs_t *) zend_object_store_get_object(object TSRMLS_CC);
+	i_obj = (php_fdfs_t *) fdfs_get_object(object);
 	php_fdfs_storage_download_file_to_buff_impl( \
 		INTERNAL_FUNCTION_PARAM_PASSTHRU, &(i_obj->context), true);
 }
@@ -6273,7 +6311,7 @@ PHP_METHOD(FastDFS, storage_download_file_to_callback)
 	zval *object = getThis();
 	php_fdfs_t *i_obj;
 
-	i_obj = (php_fdfs_t *) zend_object_store_get_object(object TSRMLS_CC);
+	i_obj = (php_fdfs_t *) fdfs_get_object(object);
 	php_fdfs_storage_download_file_to_callback_impl( \
 		INTERNAL_FUNCTION_PARAM_PASSTHRU, &(i_obj->context), false);
 }
@@ -6289,7 +6327,7 @@ PHP_METHOD(FastDFS, storage_download_file_to_callback1)
 	zval *object = getThis();
 	php_fdfs_t *i_obj;
 
-	i_obj = (php_fdfs_t *) zend_object_store_get_object(object TSRMLS_CC);
+	i_obj = (php_fdfs_t *) fdfs_get_object(object);
 	php_fdfs_storage_download_file_to_callback_impl( \
 		INTERNAL_FUNCTION_PARAM_PASSTHRU, &(i_obj->context), true);
 }
@@ -6306,7 +6344,7 @@ PHP_METHOD(FastDFS, storage_download_file_to_file)
 	zval *object = getThis();
 	php_fdfs_t *i_obj;
 
-	i_obj = (php_fdfs_t *) zend_object_store_get_object(object TSRMLS_CC);
+	i_obj = (php_fdfs_t *) fdfs_get_object(object);
 	php_fdfs_storage_download_file_to_file_impl( \
 		INTERNAL_FUNCTION_PARAM_PASSTHRU, &(i_obj->context), false);
 }
@@ -6322,7 +6360,7 @@ PHP_METHOD(FastDFS, storage_download_file_to_file1)
 	zval *object = getThis();
 	php_fdfs_t *i_obj;
 
-	i_obj = (php_fdfs_t *) zend_object_store_get_object(object TSRMLS_CC);
+	i_obj = (php_fdfs_t *) fdfs_get_object(object);
 	php_fdfs_storage_download_file_to_file_impl( \
 		INTERNAL_FUNCTION_PARAM_PASSTHRU, &(i_obj->context), true);
 }
@@ -6338,7 +6376,7 @@ PHP_METHOD(FastDFS, storage_set_metadata)
 	zval *object = getThis();
 	php_fdfs_t *i_obj;
 
-	i_obj = (php_fdfs_t *) zend_object_store_get_object(object TSRMLS_CC);
+	i_obj = (php_fdfs_t *) fdfs_get_object(object);
 	php_fdfs_storage_set_metadata_impl( \
 		INTERNAL_FUNCTION_PARAM_PASSTHRU, &(i_obj->context), false);
 }
@@ -6354,7 +6392,7 @@ PHP_METHOD(FastDFS, storage_set_metadata1)
 	zval *object = getThis();
 	php_fdfs_t *i_obj;
 
-	i_obj = (php_fdfs_t *) zend_object_store_get_object(object TSRMLS_CC);
+	i_obj = (php_fdfs_t *) fdfs_get_object(object);
 	php_fdfs_storage_set_metadata_impl( \
 		INTERNAL_FUNCTION_PARAM_PASSTHRU, &(i_obj->context), true);
 }
@@ -6369,7 +6407,7 @@ PHP_METHOD(FastDFS, storage_get_metadata)
 	zval *object = getThis();
 	php_fdfs_t *i_obj;
 
-	i_obj = (php_fdfs_t *) zend_object_store_get_object(object TSRMLS_CC);
+	i_obj = (php_fdfs_t *) fdfs_get_object(object);
 	php_fdfs_storage_get_metadata_impl( \
 		INTERNAL_FUNCTION_PARAM_PASSTHRU, &(i_obj->context), false);
 }
@@ -6384,7 +6422,7 @@ PHP_METHOD(FastDFS, storage_get_metadata1)
 	zval *object = getThis();
 	php_fdfs_t *i_obj;
 
-	i_obj = (php_fdfs_t *) zend_object_store_get_object(object TSRMLS_CC);
+	i_obj = (php_fdfs_t *) fdfs_get_object(object);
 	php_fdfs_storage_get_metadata_impl( \
 		INTERNAL_FUNCTION_PARAM_PASSTHRU, &(i_obj->context), true);
 }
@@ -6399,7 +6437,7 @@ PHP_METHOD(FastDFS, storage_file_exist)
 	zval *object = getThis();
 	php_fdfs_t *i_obj;
 
-	i_obj = (php_fdfs_t *) zend_object_store_get_object(object TSRMLS_CC);
+	i_obj = (php_fdfs_t *) fdfs_get_object(object);
 	php_fdfs_storage_file_exist_impl( \
 		INTERNAL_FUNCTION_PARAM_PASSTHRU, &(i_obj->context), false);
 }
@@ -6414,7 +6452,7 @@ PHP_METHOD(FastDFS, storage_file_exist1)
 	zval *object = getThis();
 	php_fdfs_t *i_obj;
 
-	i_obj = (php_fdfs_t *) zend_object_store_get_object(object TSRMLS_CC);
+	i_obj = (php_fdfs_t *) fdfs_get_object(object);
 	php_fdfs_storage_file_exist_impl( \
 		INTERNAL_FUNCTION_PARAM_PASSTHRU, &(i_obj->context), true);
 }
@@ -6428,7 +6466,7 @@ PHP_METHOD(FastDFS, get_last_error_no)
 	zval *object = getThis();
 	php_fdfs_t *i_obj;
 
-	i_obj = (php_fdfs_t *) zend_object_store_get_object(object TSRMLS_CC);
+	i_obj = (php_fdfs_t *) fdfs_get_object(object);
 	RETURN_LONG(i_obj->context.err_no);
 }
 
@@ -6442,9 +6480,9 @@ PHP_METHOD(FastDFS, get_last_error_info)
 	zval *object = getThis();
 	php_fdfs_t *i_obj;
 
-	i_obj = (php_fdfs_t *) zend_object_store_get_object(object TSRMLS_CC);
+	i_obj = (php_fdfs_t *) fdfs_get_object(object);
 	error_info = STRERROR(i_obj->context.err_no);
-	RETURN_STRINGL(error_info, strlen(error_info), 1);
+	ZEND_RETURN_STRINGL(error_info, strlen(error_info), 1);
 }
 
 /*
@@ -6456,7 +6494,7 @@ PHP_METHOD(FastDFS, http_gen_token)
 	zval *object = getThis();
 	php_fdfs_t *i_obj;
 
-	i_obj = (php_fdfs_t *) zend_object_store_get_object(object TSRMLS_CC);
+	i_obj = (php_fdfs_t *) fdfs_get_object(object);
 	php_fdfs_http_gen_token_impl( \
 		INTERNAL_FUNCTION_PARAM_PASSTHRU, &(i_obj->context));
 }
@@ -6470,7 +6508,7 @@ PHP_METHOD(FastDFS, get_file_info)
 	zval *object = getThis();
 	php_fdfs_t *i_obj;
 
-	i_obj = (php_fdfs_t *) zend_object_store_get_object(object TSRMLS_CC);
+	i_obj = (php_fdfs_t *) fdfs_get_object(object);
 	php_fdfs_get_file_info_impl( \
 		INTERNAL_FUNCTION_PARAM_PASSTHRU, &(i_obj->context), false);
 }
@@ -6484,7 +6522,7 @@ PHP_METHOD(FastDFS, get_file_info1)
 	zval *object = getThis();
 	php_fdfs_t *i_obj;
 
-	i_obj = (php_fdfs_t *) zend_object_store_get_object(object TSRMLS_CC);
+	i_obj = (php_fdfs_t *) fdfs_get_object(object);
 	php_fdfs_get_file_info_impl( \
 		INTERNAL_FUNCTION_PARAM_PASSTHRU, &(i_obj->context), true);
 }
@@ -6498,7 +6536,7 @@ PHP_METHOD(FastDFS, send_data)
 	zval *object = getThis();
 	php_fdfs_t *i_obj;
 
-	i_obj = (php_fdfs_t *) zend_object_store_get_object(object TSRMLS_CC);
+	i_obj = (php_fdfs_t *) fdfs_get_object(object);
 	php_fdfs_send_data_impl( \
 		INTERNAL_FUNCTION_PARAM_PASSTHRU, &(i_obj->context));
 }
@@ -6513,7 +6551,7 @@ PHP_METHOD(FastDFS, gen_slave_filename)
 	zval *object = getThis();
 	php_fdfs_t *i_obj;
 
-	i_obj = (php_fdfs_t *) zend_object_store_get_object(object TSRMLS_CC);
+	i_obj = (php_fdfs_t *) fdfs_get_object(object);
 	php_fdfs_gen_slave_filename_impl( \
 		INTERNAL_FUNCTION_PARAM_PASSTHRU, &(i_obj->context));
 }
@@ -6526,11 +6564,16 @@ PHP_METHOD(FastDFS, close)
 	zval *object = getThis();
 	php_fdfs_t *i_obj;
 
-	i_obj = (php_fdfs_t *) zend_object_store_get_object(object TSRMLS_CC);
+	i_obj = (php_fdfs_t *) fdfs_get_object(object);
 	php_fdfs_close(i_obj TSRMLS_CC);
 }
 
 ZEND_BEGIN_ARG_INFO_EX(arginfo___construct, 0, 0, 0)
+ZEND_ARG_INFO(0, config_index)
+ZEND_ARG_INFO(0, bMultiThread)
+ZEND_END_ARG_INFO()
+
+ZEND_BEGIN_ARG_INFO_EX(arginfo___destruct, 0, 0, 0)
 ZEND_END_ARG_INFO()
 
 ZEND_BEGIN_ARG_INFO_EX(arginfo_tracker_get_connection, 0, 0, 0)
@@ -7033,6 +7076,7 @@ ZEND_END_ARG_INFO()
 #define FDFS_ME(name, args) PHP_ME(FastDFS, name, args, ZEND_ACC_PUBLIC)
 static zend_function_entry fdfs_class_methods[] = {
     FDFS_ME(__construct,        arginfo___construct)
+    FDFS_ME(__destruct,         arginfo___destruct)
     FDFS_ME(tracker_get_connection,   arginfo_tracker_get_connection)
     FDFS_ME(tracker_make_all_connections, arginfo_tracker_make_all_connections)
     FDFS_ME(tracker_close_all_connections,arginfo_tracker_close_all_connections)
@@ -7108,12 +7152,13 @@ static zend_function_entry fdfs_class_methods[] = {
 #undef FDFS_ME
 /* }}} */
 
-static void php_fdfs_free_storage(php_fdfs_t *i_obj TSRMLS_DC)
+static void php_fdfs_free_storage(php_fdfs_t *i_obj)
 {
 	zend_object_std_dtor(&i_obj->zo TSRMLS_CC);
 	php_fdfs_destroy(i_obj TSRMLS_CC);
 }
 
+#if PHP_MAJOR_VERSION < 7
 zend_object_value php_fdfs_new(zend_class_entry *ce TSRMLS_DC)
 {
 	zend_object_value retval;
@@ -7124,12 +7169,27 @@ zend_object_value php_fdfs_new(zend_class_entry *ce TSRMLS_DC)
 	zend_object_std_init(&i_obj->zo, ce TSRMLS_CC);
 	retval.handle = zend_objects_store_put(i_obj, \
 		(zend_objects_store_dtor_t)zend_objects_destroy_object, \
-		(zend_objects_free_object_storage_t)php_fdfs_free_storage, \
-		NULL TSRMLS_CC);
+        NULL, NULL TSRMLS_CC);
 	retval.handlers = zend_get_std_object_handlers();
 
 	return retval;
 }
+
+#else
+
+zend_object* php_fdfs_new(zend_class_entry *ce)
+{
+	php_fdfs_t *i_obj;
+
+	i_obj = (php_fdfs_t *)ecalloc(1, sizeof(php_fdfs_t) + zend_object_properties_size(ce));
+
+	zend_object_std_init(&i_obj->zo, ce TSRMLS_CC);
+    object_properties_init(&i_obj->zo, ce);
+    i_obj->zo.handlers = &fdfs_object_handlers;
+	return &i_obj->zo;
+}
+
+#endif
 
 PHP_FASTDFS_API zend_class_entry *php_fdfs_get_ce(void)
 {
@@ -7148,15 +7208,19 @@ PHP_FASTDFS_API zend_class_entry *php_fdfs_get_exception_base(int root TSRMLS_DC
 	{
 		if (!spl_ce_RuntimeException)
 		{
-			zend_class_entry **pce;
-			zend_class_entry ***ppce;
+			zend_class_entry *pce;
+			zval *value;
 
-			ppce = &pce;
-			if (zend_hash_find(CG(class_table), "runtimeexception",
-			   sizeof("RuntimeException"), (void **) ppce) == SUCCESS)
+			if (zend_hash_find_wrapper(CG(class_table), "runtimeexception",
+			   sizeof("RuntimeException"), &value) == SUCCESS)
 			{
-				spl_ce_RuntimeException = *pce;
-				return *pce;
+				pce = Z_CE_P(value);
+				spl_ce_RuntimeException = pce;
+				return pce;
+			}
+			else
+			{
+				return NULL;
 			}
 		}
 		else
@@ -7186,16 +7250,18 @@ static int load_config_files()
 	#define ITEM_NAME_USE_CONN_POOL  "fastdfs_client.use_connection_pool"
 	#define ITEM_NAME_CONN_POOL_MAX_IDLE_TIME "fastdfs_client.connection_pool_max_idle_time"
 
-	zval conf_c;
-	zval base_path;
-	zval connect_timeout;
-	zval network_timeout;
-	zval log_level;
-	zval anti_steal_secret_key;
-	zval log_filename;
-	zval conf_filename;
-	zval use_conn_pool;
-	zval conn_pool_max_idle_time;
+	zval zarr[16];
+	zval *pz;
+	zval *conf_c;
+	zval *base_path;
+	zval *connect_timeout;
+	zval *network_timeout;
+	zval *log_level;
+	zval *anti_steal_secret_key;
+	zval *log_filename;
+	zval *conf_filename;
+	zval *use_conn_pool;
+	zval *conn_pool_max_idle_time;
 	char *pAntiStealSecretKey;
 	char szItemName[sizeof(ITEM_NAME_CONF_FILE) + 10];
 	int nItemLen;
@@ -7203,10 +7269,22 @@ static int load_config_files()
 	FDFSConfigInfo *pConfigEnd;
 	int result;
 
-	if (zend_get_configuration_directive(ITEM_NAME_CONF_COUNT, 
+	pz = zarr;
+	conf_c = pz++;
+	base_path = pz++;
+	connect_timeout = pz++;
+	network_timeout = pz++;
+	log_level = pz++;
+	anti_steal_secret_key = pz++;
+	log_filename = pz++;
+	conf_filename = pz++;
+	use_conn_pool = pz++;
+	conn_pool_max_idle_time = pz++;
+
+	if (zend_get_configuration_directive_wrapper(ITEM_NAME_CONF_COUNT, 
 		sizeof(ITEM_NAME_CONF_COUNT), &conf_c) == SUCCESS)
 	{
-		config_count = atoi(conf_c.value.str.val);
+		config_count = atoi(Z_STRVAL_P(conf_c));
 		if (config_count <= 0)
 		{
 			fprintf(stderr, "file: "__FILE__", line: %d, " \
@@ -7220,7 +7298,7 @@ static int load_config_files()
 		 config_count = 1;
 	}
 
-	if (zend_get_configuration_directive(ITEM_NAME_BASE_PATH, \
+	if (zend_get_configuration_directive_wrapper(ITEM_NAME_BASE_PATH, \
 			sizeof(ITEM_NAME_BASE_PATH), &base_path) != SUCCESS)
 	{
 		strcpy(g_fdfs_base_path, "/tmp");
@@ -7232,7 +7310,7 @@ static int load_config_files()
 	else
 	{
 		snprintf(g_fdfs_base_path, sizeof(g_fdfs_base_path), "%s", \
-			base_path.value.str.val);
+			Z_STRVAL_P(base_path));
 		chopPath(g_fdfs_base_path);
 	}
 
@@ -7248,11 +7326,11 @@ static int load_config_files()
 		return ENOTDIR;
 	}
 
-	if (zend_get_configuration_directive(ITEM_NAME_CONNECT_TIMEOUT, \
+	if (zend_get_configuration_directive_wrapper(ITEM_NAME_CONNECT_TIMEOUT, \
 			sizeof(ITEM_NAME_CONNECT_TIMEOUT), \
 			&connect_timeout) == SUCCESS)
 	{
-		g_fdfs_connect_timeout = atoi(connect_timeout.value.str.val);
+		g_fdfs_connect_timeout = atoi(Z_STRVAL_P(connect_timeout));
 		if (g_fdfs_connect_timeout <= 0)
 		{
 			g_fdfs_connect_timeout = DEFAULT_CONNECT_TIMEOUT;
@@ -7263,11 +7341,11 @@ static int load_config_files()
 		g_fdfs_connect_timeout = DEFAULT_CONNECT_TIMEOUT;
 	}
 
-	if (zend_get_configuration_directive(ITEM_NAME_NETWORK_TIMEOUT, \
+	if (zend_get_configuration_directive_wrapper(ITEM_NAME_NETWORK_TIMEOUT, \
 			sizeof(ITEM_NAME_NETWORK_TIMEOUT), \
 			&network_timeout) == SUCCESS)
 	{
-		g_fdfs_network_timeout = atoi(network_timeout.value.str.val);
+		g_fdfs_network_timeout = atoi(Z_STRVAL_P(network_timeout));
 		if (g_fdfs_network_timeout <= 0)
 		{
 			g_fdfs_network_timeout = DEFAULT_NETWORK_TIMEOUT;
@@ -7278,29 +7356,28 @@ static int load_config_files()
 		g_fdfs_network_timeout = DEFAULT_NETWORK_TIMEOUT;
 	}
 
-	if (zend_get_configuration_directive(ITEM_NAME_LOG_LEVEL, \
+	if (zend_get_configuration_directive_wrapper(ITEM_NAME_LOG_LEVEL, \
 			sizeof(ITEM_NAME_LOG_LEVEL), \
 			&log_level) == SUCCESS)
 	{
-		set_log_level(log_level.value.str.val);
+		set_log_level(Z_STRVAL_P(log_level));
 	}
 
-
-	if (zend_get_configuration_directive(ITEM_NAME_LOG_FILENAME, \
+	if (zend_get_configuration_directive_wrapper(ITEM_NAME_LOG_FILENAME, \
 			sizeof(ITEM_NAME_LOG_FILENAME), \
 			&log_filename) == SUCCESS)
 	{
-		if (log_filename.value.str.len > 0)
+		if (Z_STRLEN_P(log_filename) > 0)
 		{
-			log_set_filename(log_filename.value.str.val);
+			log_set_filename(Z_STRVAL_P(log_filename));
 		}
 	}
 
-	if (zend_get_configuration_directive(ITEM_NAME_ANTI_STEAL_SECRET_KEY, \
+	if (zend_get_configuration_directive_wrapper(ITEM_NAME_ANTI_STEAL_SECRET_KEY, \
 			sizeof(ITEM_NAME_ANTI_STEAL_SECRET_KEY), \
 			&anti_steal_secret_key) == SUCCESS)
 	{
-		pAntiStealSecretKey = anti_steal_secret_key.value.str.val;
+		pAntiStealSecretKey = Z_STRVAL_P(anti_steal_secret_key);
 	}
 	else
 	{
@@ -7323,7 +7400,7 @@ static int load_config_files()
 	{
 		nItemLen = sprintf(szItemName, "%s%d", ITEM_NAME_CONF_FILE, \
 				(int)(pConfigInfo - config_list));
-		if (zend_get_configuration_directive(szItemName, \
+		if (zend_get_configuration_directive_wrapper(szItemName, \
 			nItemLen + 1, &conf_filename) != SUCCESS)
 		{
 			if (pConfigInfo != config_list)
@@ -7335,7 +7412,7 @@ static int load_config_files()
 				return ENOENT;
 			}
 
-			if (zend_get_configuration_directive( \
+			if (zend_get_configuration_directive_wrapper( \
 				ITEM_NAME_CONF_FILE, \
 				sizeof(ITEM_NAME_CONF_FILE), \
 				&conf_filename) != SUCCESS)
@@ -7366,31 +7443,30 @@ static int load_config_files()
 		}
 
 		if ((result=fdfs_load_tracker_group(pConfigInfo->pTrackerGroup, 
-				conf_filename.value.str.val)) != 0)
+				Z_STRVAL_P(conf_filename))) != 0)
 		{
 			return result;
 		}
 	}
 
-
-	if (zend_get_configuration_directive(ITEM_NAME_USE_CONN_POOL, 
+	if (zend_get_configuration_directive_wrapper(ITEM_NAME_USE_CONN_POOL,
 		sizeof(ITEM_NAME_USE_CONN_POOL), &use_conn_pool) == SUCCESS)
 	{
 		char *use_conn_pool_str;
 
-		use_conn_pool_str = use_conn_pool.value.str.val;
+		use_conn_pool_str = Z_STRVAL_P(use_conn_pool);
 		if (strcasecmp(use_conn_pool_str, "yes") == 0 || 
 			strcasecmp(use_conn_pool_str, "on") == 0 ||
 			strcasecmp(use_conn_pool_str, "true") == 0 ||
 			strcmp(use_conn_pool_str, "1") == 0)
 		{
-			if (zend_get_configuration_directive( \
+			if (zend_get_configuration_directive_wrapper( \
 				ITEM_NAME_CONN_POOL_MAX_IDLE_TIME, \
 				sizeof(ITEM_NAME_CONN_POOL_MAX_IDLE_TIME), \
 				&conn_pool_max_idle_time) == SUCCESS)
 			{
 			g_connection_pool_max_idle_time = \
-				atoi(conn_pool_max_idle_time.value.str.val);
+				atoi(Z_STRVAL_P(conn_pool_max_idle_time));
 			if (g_connection_pool_max_idle_time <= 0)
 			{
 				logError("file: "__FILE__", line: %d, " \
@@ -7417,7 +7493,6 @@ static int load_config_files()
 		}
 	}
 
-
 	logDebug("base_path=%s, connect_timeout=%d, network_timeout=%d, " \
 		"anti_steal_secret_key length=%d, " \
 		"tracker_group_count=%d, first tracker group server_count=%d, "\
@@ -7440,7 +7515,14 @@ PHP_MINIT_FUNCTION(fastdfs_client)
 		return FAILURE;
 	}
 
-	le_fdht = zend_register_list_destructors_ex(NULL, php_fdfs_dtor, \
+#if PHP_MAJOR_VERSION >= 7
+	memcpy(&fdfs_object_handlers, zend_get_std_object_handlers(), sizeof(zend_object_handlers));
+	fdfs_object_handlers.offset = XtOffsetOf(php_fdfs_t, zo);
+	fdfs_object_handlers.free_obj = NULL;
+	fdfs_object_handlers.clone_obj = NULL;
+#endif
+
+	le_fdfs = zend_register_list_destructors_ex(NULL, php_fdfs_dtor, \
 			"FastDFS", module_number);
 
 	INIT_CLASS_ENTRY(ce, "FastDFS", fdfs_class_methods);
@@ -7448,8 +7530,13 @@ PHP_MINIT_FUNCTION(fastdfs_client)
 	fdfs_ce->create_object = php_fdfs_new;
 
 	INIT_CLASS_ENTRY(ce, "FastDFSException", NULL);
+#if PHP_MAJOR_VERSION < 7
 	fdfs_exception_ce = zend_register_internal_class_ex(&ce, \
 		php_fdfs_get_exception_base(0 TSRMLS_CC), NULL TSRMLS_CC);
+#else
+	fdfs_exception_ce = zend_register_internal_class_ex(&ce, \
+		php_fdfs_get_exception_base(0 TSRMLS_CC));
+#endif
 
 	REGISTER_STRING_CONSTANT("FDFS_FILE_ID_SEPERATOR", \
 			FDFS_FILE_ID_SEPERATE_STR, \

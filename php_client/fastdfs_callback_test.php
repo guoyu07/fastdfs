@@ -79,12 +79,13 @@
  {
 	//var_dump($args);
 
-	return fastdfs_send_data($sock, $args['buff']);
+	$ret = fastdfs_send_data($sock, $args['buff']);
+	return $ret;
  }
 
  function my_download_file_callback($args, $file_size, $data)
  {
-	var_dump($args);
+	//var_dump($args);
 
 	if ($args['fhandle'] == NULL)
 	{
